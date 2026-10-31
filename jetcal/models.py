@@ -1,0 +1,211 @@
+# Philippe Joly, ATLAS Level-0 trigger ML
+"""EnergyFlow Particle Flow Network regressor and the binned-median baseline.
+
+A run directory stores the model as "spec + weights" (``model_spec.json`` +
+``model.weights.h5``): the graph is rebuilt from the spec on load, which
+avoids Keras serialization incompatibilities. When the spec carries an
+active quantization block the graph is rebuilt with fake quantizers, so the
+same float checkpoint serves the float and the fixed-point model (PTQ).
+"""
+from __future__ import annotations
+
+import dataclasses
+import importlib
+import json
+from pathlib import Path
+from typing import Any, Dict, Optional, Union
+
+import numpy as np
+import tensorflow as tf
+
+from jetcal.config import ModelConfig, QuantConfig, TrainingConfig
+
+SPEC_FILE, WEIGHTS_FILE, BASELINE_FILE = ("model_spec.json", "model.weights.h5",
+                                          "baseline.json")
+
+
+def _import_pfn() -> Any:
+    try:
+        from energyflow.archs.efn import PFN
+    except ModuleNotFoundError as err:
+        raise ImportError("the PFN needs 'energyflow' (and 'tf_keras' for "
+                          "energyflow >= 1.4)") from err
+    return PFN
+
+
+class PFNRegressor:
+    """PFN over the dataset dict: ``fit`` / ``predict`` / ``forward`` / ``save``.
+
+    The PFN infers padding from all-zero constituent rows (``mask_val=0``), so
+    inputs are re-zeroed on pads with the stored mask before every call.
+    """
+
+    def __init__(self, model_cfg: ModelConfig, input_dim: int, global_dim: int,
+                 name: str = "pfn", quant_cfg: Optional[QuantConfig] = None) -> None:
+        self.model_cfg, self.name = model_cfg, name
+        self.input_dim, self.global_dim = int(input_dim), int(global_dim)
+        self.quant_cfg = quant_cfg if quant_cfg and quant_cfg.mode != "off" else None
+        c = model_cfg
+        phi_sizes = tuple(c.phi_sizes) + ((int(c.latent_dim),) if c.latent_dim else ())
+        kwargs: Dict[str, Any] = dict(
+            input_dim=input_dim, output_dim=1, Phi_sizes=phi_sizes,
+            F_sizes=c.f_sizes, Phi_acts=c.phi_act, F_acts=c.f_act,
+            output_act=c.output_act, F_dropouts=c.f_dropout,
+            latent_dropout=c.latent_dropout, mask_val=0.0,
+            compile=False, summary=False)  # compiled in fit()
+        if global_dim:
+            kwargs["num_global_features"] = global_dim
+        self._pfn = _import_pfn()(**kwargs)
+        self.model = self._pfn.model
+        if self.quant_cfg is not None and self.quant_cfg.graph_quant:
+            from jetcal.quantization import quantize_functional_model
+            self.model = quantize_functional_model(self._pfn.model, self.keras,
+                                                   self.quant_cfg)
+
+    @property
+    def keras(self) -> Any:
+        """Keras module backing the PFN (``tf_keras`` for energyflow >= 1.4)."""
+        return importlib.import_module(type(self._pfn.model).__module__.split(".")[0])
+
+    def n_params(self) -> int:
+        return int(self.model.count_params())
+
+    def _adapt(self, d: dict) -> Any:
+        """Dataset dict -> PFN inputs (pads re-zeroed)."""
+        if d["x_phi"].shape[-1] != self.input_dim or \
+                d["x_glob"].shape[-1] != self.global_dim:
+            raise ValueError(f"inputs ({d['x_phi'].shape[-1]}, {d['x_glob'].shape[-1]}) "
+                             f"!= model ({self.input_dim}, {self.global_dim})")
+        x = np.asarray(d["x_phi"], np.float32) * np.asarray(d["mask"], np.float32)[..., None]
+        return [x, np.asarray(d["x_glob"], np.float32)] if self.global_dim else x
+
+    def fit(self, train: dict, y_train: np.ndarray, val: dict, y_val: np.ndarray,
+            run_dir: Union[str, Path], cfg: TrainingConfig) -> Dict[str, list]:
+        """Train on standardized targets; the best epoch is restored and saved."""
+        km, run_dir = self.keras, Path(run_dir)
+        opt = dict(learning_rate=cfg.learning_rate,
+                   **({"clipnorm": cfg.clipnorm} if cfg.clipnorm else {}))
+        optimizer = (km.optimizers.AdamW(weight_decay=cfg.weight_decay, **opt)
+                     if cfg.optimizer == "adamw" else km.optimizers.Adam(**opt))
+        loss = km.losses.Huber(delta=cfg.huber_delta) if cfg.loss == "huber" else cfg.loss
+        self.model.compile(optimizer=optimizer, loss=loss, metrics=["mae"])
+        ckpt = run_dir / WEIGHTS_FILE
+        callbacks = [
+            km.callbacks.ModelCheckpoint(str(ckpt), monitor=cfg.monitor,
+                                         save_best_only=True, save_weights_only=True),
+            km.callbacks.EarlyStopping(monitor=cfg.monitor, patience=cfg.es_patience,
+                                       restore_best_weights=True, verbose=1),
+            km.callbacks.ReduceLROnPlateau(monitor=cfg.monitor, factor=cfg.rlr_factor,
+                                           patience=cfg.rlr_patience,
+                                           min_lr=cfg.min_lr, verbose=1),
+            km.callbacks.CSVLogger(str(run_dir / "training_log.csv"))]
+        hist = self.model.fit(self._adapt(train), y_train,
+                              validation_data=(self._adapt(val), y_val),
+                              epochs=cfg.epochs, batch_size=cfg.batch_size,
+                              shuffle=True, verbose=cfg.verbose, callbacks=callbacks)
+        if ckpt.exists():  # EarlyStopping restores only if patience ran out
+            self.model.load_weights(str(ckpt))
+        return {k: [float(v) for v in vals] for k, vals in hist.history.items()}
+
+    def predict(self, d: dict, batch_size: int = 4096) -> np.ndarray:
+        """Standardized predictions ``(N, 1)``."""
+        z = self.model.predict(self._adapt(d), batch_size=batch_size, verbose=0)
+        return np.asarray(z, np.float64).reshape(len(d["mask"]), -1)
+
+    def forward(self, x_phi: tf.Tensor, x_glob: Optional[tf.Tensor],
+                mask: tf.Tensor) -> tf.Tensor:
+        """Differentiable forward pass on tensors (used by attribution).
+
+        The PFN's own mask is a non-differentiable cast, so gradients reach
+        ``x_phi`` only through Phi and pads get exactly zero attribution.
+        """
+        x = x_phi * tf.cast(mask, x_phi.dtype)[..., tf.newaxis]
+        return self.model([x, x_glob] if self.global_dim else x, training=False)
+
+    def save(self, run_dir: Union[str, Path]) -> None:
+        """Write the spec and the weights into ``run_dir``."""
+        run_dir = Path(run_dir)
+        run_dir.mkdir(parents=True, exist_ok=True)
+        spec = {"name": self.name, "input_dim": self.input_dim,
+                "global_dim": self.global_dim,
+                "model": dataclasses.asdict(self.model_cfg),
+                "quant": dataclasses.asdict(self.quant_cfg) if self.quant_cfg else None}
+        (run_dir / SPEC_FILE).write_text(json.dumps(spec, indent=2) + "\n")
+        self.model.save_weights(str(run_dir / WEIGHTS_FILE))
+
+
+def load_regressor(run_dir: Union[str, Path],
+                   quant_override: Optional[QuantConfig] = None) -> PFNRegressor:
+    """Rebuild a saved PFN; quantizers follow the spec unless overridden.
+
+    Args:
+        run_dir: Directory holding ``model_spec.json`` and the weights.
+        quant_override: Replace the stored quantization (``mode="off"`` -> float).
+    """
+    run_dir = Path(run_dir)
+    for p in (run_dir / SPEC_FILE, run_dir / WEIGHTS_FILE):
+        if not p.is_file():
+            raise FileNotFoundError(f"missing model artifact: {p}")
+    spec = json.loads((run_dir / SPEC_FILE).read_text())
+    if quant_override is not None:
+        qcfg = quant_override
+    else:
+        stored = spec.get("quant")
+        qcfg = QuantConfig(**stored) if stored else None
+    reg = PFNRegressor(ModelConfig.from_dict(spec["model"]), spec["input_dim"],
+                       spec["global_dim"], spec["name"], quant_cfg=qcfg)
+    reg.model.load_weights(str(run_dir / WEIGHTS_FILE))
+    return reg
+
+
+class BinnedMedianCorrection:
+    """Baseline: median of log(pT_true/pT_EM) in log-spaced pT_EM bins.
+
+    Closure-correct per bin by construction, so a model must beat it in
+    resolution to show it uses constituent information.
+    """
+
+    def __init__(self, n_bins: int = 40, min_per_bin: int = 50) -> None:
+        self.n_bins, self.min_per_bin = int(n_bins), int(min_per_bin)
+        self.edges: Optional[np.ndarray] = None
+        self.table: Optional[np.ndarray] = None
+
+    def fit(self, y: np.ndarray, pt_reco: np.ndarray) -> "BinnedMedianCorrection":
+        """Per-bin medians of ``y``; sparse bins fall back to the global median."""
+        y, pt = np.ravel(y).astype(np.float64), np.ravel(pt_reco).astype(np.float64)
+        if len(y) != len(pt) or not len(y) or np.any(pt <= 0):
+            raise ValueError("need equal-length, non-empty y and pt_reco > 0")
+        lo, hi = np.quantile(np.log(pt), [0.001, 0.999])
+        self.edges = np.exp(np.linspace(lo, hi, self.n_bins + 1))
+        idx = self._bin(pt)
+        self.table = np.full(self.n_bins, float(np.median(y)))
+        for i in range(self.n_bins):
+            if (idx == i).sum() >= self.min_per_bin:
+                self.table[i] = np.median(y[idx == i])
+        return self
+
+    def _bin(self, pt: np.ndarray) -> np.ndarray:
+        return np.clip(np.digitize(pt, self.edges) - 1, 0, self.n_bins - 1)
+
+    def predict(self, pt_reco: np.ndarray) -> np.ndarray:
+        """Predicted log(pT_true/pT_EM); out-of-range jets use the edge bins."""
+        if self.table is None:
+            raise RuntimeError("predict() called before fit()")
+        return self.table[self._bin(np.ravel(pt_reco).astype(np.float64))]
+
+    def save(self, run_dir: Union[str, Path]) -> None:
+        (Path(run_dir) / BASELINE_FILE).write_text(json.dumps(
+            {"n_pt_bins": self.n_bins, "min_per_bin": self.min_per_bin,
+             "pt_edges": self.edges.tolist(), "table": self.table.tolist()},
+            indent=2) + "\n")
+
+    @classmethod
+    def load(cls, run_dir: Union[str, Path]) -> "BinnedMedianCorrection":
+        path = Path(run_dir) / BASELINE_FILE
+        if not path.is_file():
+            raise FileNotFoundError(f"baseline not found: {path}")
+        d = json.loads(path.read_text())
+        obj = cls(d["n_pt_bins"], d["min_per_bin"])
+        obj.edges = np.asarray(d["pt_edges"])
+        obj.table = np.asarray(d["table"], np.float64).reshape(obj.n_bins, -1)[:, 0]
+        return obj

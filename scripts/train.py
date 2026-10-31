@@ -1,0 +1,45 @@
+#!/usr/bin/env python3
+# Philippe Joly, ATLAS Level-0 trigger ML
+"""Train one PFN from a JSON run config.
+
+Writes <out-dir>/<name>/ (config, model spec + weights, binned-median
+baseline, training log). Evaluate it afterwards with scripts/evaluate.py.
+
+Example:
+    python scripts/train.py --config configs/trigger_tiny.json \\
+        --dataset $DATA/AntiKt4EMTopo422NoPtCutJets_train.npz --out-dir runs
+"""
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from jetcal.config import RunConfig  # noqa: E402
+from jetcal.data import load_dataset  # noqa: E402
+from jetcal.training import run_training  # noqa: E402
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--config", required=True, help="run config JSON")
+    p.add_argument("--dataset", required=True, help="training-split .npz")
+    p.add_argument("--out-dir", required=True, help="parent directory of run directories")
+    p.add_argument("--name", help="override the run name")
+    p.add_argument("--seed", type=int, help="override the seed")
+    p.add_argument("--epochs", type=int, help="override the epoch budget")
+    a = p.parse_args()
+
+    cfg = RunConfig.load(a.config)
+    cfg.name = a.name or cfg.name
+    cfg.seed = cfg.seed if a.seed is None else a.seed
+    cfg.training.epochs = a.epochs or cfg.training.epochs
+    run_training(cfg, load_dataset(a.dataset), a.out_dir)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

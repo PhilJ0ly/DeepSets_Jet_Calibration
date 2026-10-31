@@ -1,0 +1,251 @@
+# Philippe Joly, ATLAS Level-0 trigger ML
+"""Typed, JSON round-trip run configuration.
+
+One :class:`RunConfig` fully specifies a run (architecture, inputs,
+optimization, fixed-point settings) and is written to ``<run>/config.json``,
+so every result can be reproduced from the run directory alone. Omitted
+fields take the defaults below (the values used in the report).
+"""
+from __future__ import annotations
+
+import dataclasses
+import json
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Optional, Sequence, Union
+
+TARGET = "log_pt_over_reco"           # regression target log(pT_true / pT_EM)
+VALID_QUANT_COMPONENTS = ("phi", "f", "output")
+
+# keys written by earlier versions (native DeepSets backend, QAT); accepted
+# and ignored on load so old run directories stay readable
+_LEGACY_MODEL_KEYS = {"backend", "pooling", "global_mode", "phi_dropout",
+                      "normalization", "l2", "zero_init_output"}
+
+
+def _tuple(x: Optional[Sequence[Any]]) -> tuple:
+    return () if x is None else tuple(x)
+
+
+def _build(klass: type, d: dict, section: str, ignore: set = frozenset()) -> Any:
+    """Instantiate a config section, rejecting unknown keys (typo guard)."""
+    known = {f.name for f in dataclasses.fields(klass)}
+    unknown = set(d) - known - set(ignore)
+    if unknown:
+        raise KeyError(f"unknown {section} config keys: {sorted(unknown)}")
+    return klass(**{k: v for k, v in d.items() if k in known})
+
+
+@dataclass
+class ModelConfig:
+    """EnergyFlow Particle Flow Network: Phi -> sum pool -> concat globals -> F.
+
+    Attributes:
+        phi_sizes: Per-constituent Phi layer widths (last = latent dimension).
+        f_sizes: Post-pooling F layer widths.
+        latent_dim: Optional extra Phi layer setting the latent width.
+        phi_act / f_act / output_act: Keras activation names.
+        f_dropout / latent_dropout: Dropout rates.
+    """
+
+    phi_sizes: tuple = (64, 64, 64)
+    f_sizes: tuple = (64, 64, 64)
+    latent_dim: Optional[int] = None
+    phi_act: str = "relu"
+    f_act: str = "relu"
+    output_act: str = "linear"
+    f_dropout: float = 0.0
+    latent_dropout: float = 0.0
+
+    def __post_init__(self) -> None:
+        self.phi_sizes, self.f_sizes = _tuple(self.phi_sizes), _tuple(self.f_sizes)
+        for name in ("phi_sizes", "f_sizes"):
+            sizes = getattr(self, name)
+            if not sizes or not all(int(s) > 0 for s in sizes):
+                raise ValueError(f"{name} must be non-empty positive ints, got {sizes}")
+        for name in ("f_dropout", "latent_dropout"):
+            if not 0.0 <= getattr(self, name) < 1.0:
+                raise ValueError(f"{name} must be in [0, 1)")
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "ModelConfig":
+        """Build from a dict; legacy keys are ignored, a non-PFN backend fails."""
+        if d.get("backend", "energyflow") != "energyflow":
+            raise ValueError(f"backend={d['backend']!r} is not supported; "
+                             "this package implements the EnergyFlow PFN only")
+        return _build(cls, d, "model", _LEGACY_MODEL_KEYS)
+
+
+@dataclass
+class TrainingConfig:
+    """Optimization and training-loop settings (Huber loss, AdamW).
+
+    ``val_frac`` is carved from the training file with the run seed;
+    ``monitor`` drives checkpointing, early stopping and LR decay.
+    """
+
+    loss: str = "huber"
+    huber_delta: float = 1.0
+    optimizer: str = "adamw"
+    learning_rate: float = 1e-3
+    weight_decay: float = 1e-4
+    clipnorm: Optional[float] = 1.0
+    epochs: int = 300
+    batch_size: int = 1024
+    val_frac: float = 0.15
+    monitor: str = "val_loss"
+    es_patience: int = 40
+    rlr_patience: int = 10
+    rlr_factor: float = 0.3
+    min_lr: float = 1e-6
+    verbose: int = 2
+
+    def __post_init__(self) -> None:
+        if self.loss not in ("huber", "mae", "mse"):
+            raise ValueError(f"loss={self.loss!r}; use 'huber', 'mae' or 'mse'")
+        if self.optimizer not in ("adam", "adamw"):
+            raise ValueError(f"optimizer={self.optimizer!r}; use 'adam' or 'adamw'")
+        if not 0.0 < self.val_frac < 1.0:
+            raise ValueError(f"val_frac={self.val_frac} must be in (0, 1)")
+        if self.epochs < 1 or self.batch_size < 1:
+            raise ValueError("epochs and batch_size must be >= 1")
+
+
+@dataclass
+class FeatureConfig:
+    """Input columns, selected by label from the dataset (``None`` = all)."""
+
+    phi: Optional[tuple] = None
+    glob: Optional[tuple] = None
+    target: tuple = (TARGET,)
+
+    def __post_init__(self) -> None:
+        self.phi = None if self.phi is None else _tuple(self.phi)
+        self.glob = None if self.glob is None else _tuple(self.glob)
+        self.target = _tuple(self.target)
+        if self.target != (TARGET,):
+            raise ValueError(f"target must be [{TARGET!r}], got {list(self.target)}")
+
+
+def check_bits(bits: Optional[int], int_bits: int, name: str) -> None:
+    """Validate Q(bits, int_bits) = 1 sign + int_bits + (bits-1-int_bits) frac."""
+    if bits is None:
+        return
+    if not 2 <= int(bits) <= 32:
+        raise ValueError(f"{name}: total width {bits} outside [2, 32]")
+    if not 0 <= int(int_bits) <= int(bits) - 1:
+        raise ValueError(f"{name}: int_bits={int_bits} incompatible with bits={bits}")
+
+
+@dataclass
+class QuantConfig:
+    """Post-training fixed-point quantization (PTQ).
+
+    Every quantity is a signed, saturating Q(bits, int_bits) word: 1 sign bit,
+    ``int_bits`` integer bits, the rest fractional. Size ``*_int_bits`` from
+    the measured range (``scripts/dynamic_range.py``) first, then scan the
+    total width. ``None`` keeps that quantity float.
+
+    Attributes:
+        mode: ``"off"`` (float) or ``"ptq"`` (quantized at inference).
+        weight_bits / weight_int_bits: Kernel format.
+        act_bits / act_int_bits: Layer-output format (biases use act_int_bits).
+        components: Sub-networks to quantize, subset of ``phi``, ``f``, ``output``.
+        input_phi_bits / input_glob_bits: Standardized-input widths, an int or
+            ``{label: bits, "default": bits}``.
+        input_int_bits: Integer bits of the input format.
+    """
+
+    mode: str = "off"
+    weight_bits: Optional[int] = None
+    weight_int_bits: int = 1
+    act_bits: Optional[int] = None
+    act_int_bits: int = 3
+    components: tuple = VALID_QUANT_COMPONENTS
+    input_phi_bits: Optional[Union[int, dict]] = None
+    input_glob_bits: Optional[Union[int, dict]] = None
+    input_int_bits: int = 3
+
+    def __post_init__(self) -> None:
+        self.components = _tuple(self.components)
+        if self.mode not in ("off", "ptq"):
+            raise ValueError(f"quant mode={self.mode!r}; use 'off' or 'ptq'")
+        bad = set(self.components) - set(VALID_QUANT_COMPONENTS)
+        if bad:
+            raise ValueError(f"unknown quant components {sorted(bad)}")
+        check_bits(self.weight_bits, self.weight_int_bits, "weight_bits")
+        check_bits(self.act_bits, self.act_int_bits, "act_bits")
+        for name in ("input_phi_bits", "input_glob_bits"):
+            spec = getattr(self, name)
+            specs = spec.values() if isinstance(spec, dict) else [spec]
+            for b in specs:
+                check_bits(b, self.input_int_bits, name)
+
+    @property
+    def graph_quant(self) -> bool:
+        """True when weights and/or activations are quantized."""
+        return (self.mode != "off" and bool(self.components)
+                and (self.weight_bits is not None or self.act_bits is not None))
+
+    @property
+    def input_quant(self) -> bool:
+        """True when any input feature is quantized."""
+        return self.mode != "off" and (self.input_phi_bits is not None
+                                       or self.input_glob_bits is not None)
+
+    def describe(self) -> str:
+        """One-line summary for logs."""
+        if self.mode == "off":
+            return "float32"
+        parts = ["ptq"]
+        if self.weight_bits is not None:
+            parts.append(f"W=Q({self.weight_bits},{self.weight_int_bits})")
+        if self.act_bits is not None:
+            parts.append(f"A=Q({self.act_bits},{self.act_int_bits})")
+        if self.input_quant:
+            parts.append(f"in=({self.input_phi_bits},{self.input_glob_bits};"
+                         f"{self.input_int_bits})")
+        return " ".join(parts)
+
+
+@dataclass
+class RunConfig:
+    """Complete, reproducible description of one run."""
+
+    name: str = "run"
+    seed: int = 0
+    model: ModelConfig = field(default_factory=ModelConfig)
+    training: TrainingConfig = field(default_factory=TrainingConfig)
+    features: FeatureConfig = field(default_factory=FeatureConfig)
+    quant: QuantConfig = field(default_factory=QuantConfig)
+
+    def to_dict(self) -> dict:
+        return dataclasses.asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "RunConfig":
+        """Inverse of :meth:`to_dict`; unknown keys raise ``KeyError``."""
+        d = dict(d)
+        unknown = set(d) - {"name", "seed", "model", "training", "features", "quant"}
+        if unknown:
+            raise KeyError(f"unknown run config keys: {sorted(unknown)}")
+        return cls(name=str(d.get("name", "run")), seed=int(d.get("seed", 0)),
+                   model=ModelConfig.from_dict(dict(d.get("model", {}))),
+                   training=_build(TrainingConfig, dict(d.get("training", {})),
+                                   "training"),
+                   features=_build(FeatureConfig, dict(d.get("features", {})),
+                                   "features"),
+                   quant=_build(QuantConfig, dict(d.get("quant", {})), "quant"))
+
+    def save(self, path: Union[str, Path]) -> Path:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(self.to_dict(), indent=2) + "\n")
+        return path
+
+    @classmethod
+    def load(cls, path: Union[str, Path]) -> "RunConfig":
+        path = Path(path)
+        if not path.is_file():
+            raise FileNotFoundError(f"run config not found: {path}")
+        return cls.from_dict(json.loads(path.read_text()))

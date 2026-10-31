@@ -1,0 +1,18 @@
+# Philippe Joly, ATLAS Level-0 trigger ML
+"""jetcal: DeepSets (EnergyFlow PFN) jet energy calibration for the ATLAS L0 trigger.
+
+ROOT ntuples -> normalized datasets -> PFN regression of log(pT_true/pT_EM)
+-> evaluation against the uncalibrated response and a binned-median
+baseline -> post-training fixed-point quantization -> input relevance.
+"""
+import os
+
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")  # silence TF info logs
+
+from jetcal.config import (FeatureConfig, ModelConfig, QuantConfig, RunConfig,
+                           TrainingConfig)
+from jetcal.data import load_dataset, save_dataset, select_features
+
+__version__ = "2.0.0"
+__all__ = ["FeatureConfig", "ModelConfig", "QuantConfig", "RunConfig",
+           "TrainingConfig", "load_dataset", "save_dataset", "select_features"]

@@ -1,0 +1,4 @@
+{
+  "cluster energy + jet scale": ["const:log_pt_c", "glob:log_pt_reco"],
+  "pseudorapidity": ["const:eta_c", "glob:eta", "glob:abs_eta"]
+}

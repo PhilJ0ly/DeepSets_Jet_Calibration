@@ -1,0 +1,60 @@
+#!/usr/bin/env python3
+# Philippe Joly, ATLAS Level-0 trigger ML
+"""Build normalized train/test datasets from ROOT ntuples (or a toy sample).
+
+Outputs (in --out-dir):
+    <calib>_train.npz, <calib>_test.npz
+    qa/<calib>_selection_qa.{svg,png}     (ROOT input only)
+
+Examples:
+    python scripts/process_data.py --raw-dir $RAW_DATA_DIR --out-dir $DATA \\
+        --calib AntiKt4EMTopo422NoPtCutJets
+    python scripts/process_data.py --toy 200000 --out-dir data/toy
+"""
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    src = p.add_mutually_exclusive_group(required=True)
+    src.add_argument("--raw-dir", help="directory searched recursively for .root files")
+    src.add_argument("--toy", type=int, metavar="N", help="generate N synthetic jets instead")
+    p.add_argument("--out-dir", required=True)
+    p.add_argument("--calib", default="AntiKt4EMTopo422NoPtCutJets",
+                   help="jet collection branch prefix (also the output file stem)")
+    p.add_argument("--tree", default="ntuple")
+    p.add_argument("--max-const", type=int, default=80, help="constituent padding length")
+    p.add_argument("--pt-cut", type=float, default=10.0, help="truth-jet pT cut [GeV]")
+    p.add_argument("--test-frac", type=float, default=0.15)
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--no-qa-plots", action="store_true")
+    a = p.parse_args()
+
+    if a.toy:
+        from jetcal.data import save_dataset
+        from jetcal.toy import make_toy_splits
+        out = Path(a.out_dir)
+        for split, d in zip(("train", "test"), make_toy_splits(
+                a.toy, max_const=min(a.max_const, 25), seed=a.seed,
+                test_frac=a.test_frac)):
+            print(f"[process] wrote {save_dataset(out / f'{a.calib}_{split}.npz', d)} "
+                  f"({len(d['y']):,} toy jets)")
+        return 0
+
+    from jetcal.root_processing import ProcessingConfig, produce_datasets
+    cfg = ProcessingConfig(calib=a.calib, tree_name=a.tree, max_const=a.max_const,
+                           pt_cut=a.pt_cut, test_frac=a.test_frac, seed=a.seed,
+                           qa_plots=not a.no_qa_plots)
+    produce_datasets(a.raw_dir, a.out_dir, cfg)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

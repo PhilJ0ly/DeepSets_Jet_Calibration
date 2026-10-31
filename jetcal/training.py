@@ -1,0 +1,60 @@
+# Philippe Joly, ATLAS Level-0 trigger ML
+"""Train one run: config + training file -> self-contained run directory.
+
+Training writes model artifacts only (no plots, no metrics):
+
+    config.json        the full RunConfig
+    model_spec.json    architecture spec (rebuilds the graph)
+    model.weights.h5   best-epoch weights
+    baseline.json      binned-median baseline, fitted on the same jets
+    training_log.csv   per-epoch losses
+"""
+from __future__ import annotations
+
+import random
+import time
+from pathlib import Path
+from typing import Union
+
+import numpy as np
+import tensorflow as tf
+
+from jetcal.config import RunConfig
+from jetcal.data import (carve_validation, select_features, standardize_targets,
+                         validate_dataset)
+from jetcal.models import BinnedMedianCorrection, PFNRegressor
+
+
+def set_global_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    tf.random.set_seed(seed)
+
+
+def run_training(cfg: RunConfig, dataset: dict, out_root: Union[str, Path]) -> Path:
+    """Train ``cfg`` on ``dataset`` (training split) into ``<out_root>/<name>``."""
+    if cfg.quant.mode != "off":
+        raise ValueError("train in float; build quantized runs with scripts/make_ptq.py")
+    t0 = time.time()
+    run_dir = Path(out_root) / cfg.name
+    run_dir.mkdir(parents=True, exist_ok=True)
+    set_global_seed(cfg.seed)
+    cfg.save(run_dir / "config.json")
+
+    validate_dataset(dataset)
+    d = select_features(dataset, phi=cfg.features.phi, glob=cfg.features.glob,
+                        target=list(cfg.features.target))
+    fit_set, val_set = carve_validation(d, cfg.training.val_frac, cfg.seed)
+    norm_y = d["norm"]["y"]
+    y_fit = standardize_targets(fit_set["y"], norm_y)
+    y_val = standardize_targets(val_set["y"], norm_y)
+
+    model = PFNRegressor(cfg.model, len(d["phi_lbls"]), len(d["glob_lbls"]), cfg.name)
+    print(f"[train] '{cfg.name}': {model.n_params():,} parameters, "
+          f"{len(y_fit)} fit / {len(y_val)} val jets -> {run_dir}")
+    history = model.fit(fit_set, y_fit, val_set, y_val, run_dir, cfg.training)
+    model.save(run_dir)
+    BinnedMedianCorrection().fit(fit_set["y"][:, 0], fit_set["pt_reco"]).save(run_dir)
+    print(f"[train] {len(history['loss'])} epochs, best val_loss "
+          f"{min(history['val_loss']):.4f}, {time.time() - t0:.0f}s")
+    return run_dir

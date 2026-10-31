@@ -1,0 +1,139 @@
+#!/usr/bin/env python3
+# Philippe Joly, ATLAS Level-0 trigger ML
+"""Measure a trained run's dynamic range and size the fixed-point integer bits.
+
+Step 1 of the PTQ workflow: range first, resolution second. Too few integer
+bits saturate (a scale-biasing distortion that mimics a resolution loss), so
+fix int_bits here, then scan the total width with scripts/quant_scan.py.
+
+Q(bits, int_bits) = 1 sign + int_bits integer + (bits - 1 - int_bits)
+fractional bits, saturating below 2^int_bits. Three blocks are measured:
+    kernels                     -> --weight-int-bits
+    layer outputs and biases    -> --act-int-bits  (includes the pooled latent sum)
+    standardized inputs         -> --input-int-bits
+
+Prints a per-tensor table and the suggested quant_scan.py flags.
+
+Example:
+    python scripts/dynamic_range.py --run runs/scan_3x8 \\
+        --dataset $DATA/AntiKt4EMTopo422NoPtCutJets_train.npz --split val
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+from typing import Dict, Tuple
+
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from jetcal.data import load_dataset, subsample  # noqa: E402
+from jetcal.evaluation import load_run_context  # noqa: E402
+from jetcal.models import load_regressor  # noqa: E402
+
+
+def int_bits_for(max_abs: float) -> int:
+    """Smallest int_bits with 2^int_bits > max_abs (0 below 1)."""
+    if not np.isfinite(max_abs) or max_abs <= 0:
+        return 0
+    return max(0, int(np.floor(np.log2(max_abs))) + 1)
+
+
+def weight_ranges(reg) -> Tuple[Dict[str, float], Dict[str, float]]:
+    """Max |kernel| and max |bias| per layer."""
+    kernels, biases = {}, {}
+    for layer in reg.model.layers:
+        for w in layer.weights:
+            name = f"{layer.name}/{w.name.split('/')[-1].split(':')[0]}"
+            (biases if "bias" in w.name else kernels)[name] = float(np.abs(w.numpy()).max())
+    return kernels, biases
+
+
+def activation_ranges(reg, d: dict, batch: int = 8192) -> Dict[str, float]:
+    """Max |output| of every layer over the data (one multi-output probe model)."""
+    km, model = reg.keras, reg.model
+    layers = [l for l in model.layers if not isinstance(l, km.layers.InputLayer)]
+    probe = km.Model(model.inputs, [l.output for l in layers])
+    x = reg._adapt(d)
+    xs = x if isinstance(x, list) else [x]
+    out = dict.fromkeys((l.name for l in layers), 0.0)
+    for i in range(0, len(xs[0]), batch):
+        chunk = [a[i:i + batch] for a in xs]
+        for layer, y in zip(layers, probe.predict(chunk if len(chunk) > 1 else chunk[0],
+                                                  verbose=0)):
+            out[layer.name] = max(out[layer.name], float(np.abs(y).max()))
+    return out
+
+
+def input_ranges(d: dict) -> Dict[str, float]:
+    """Max |value| per standardized input (pads excluded)."""
+    x_phi = np.abs(d["x_phi"] * d["mask"][..., None])
+    out = {f"phi:{l}": float(x_phi[..., j].max()) for j, l in enumerate(d["phi_lbls"])}
+    out.update({f"glob:{l}": float(np.abs(d["x_glob"][:, j]).max())
+                for j, l in enumerate(d["glob_lbls"])})
+    return out
+
+
+def table(title: str, values: Dict[str, float]) -> int:
+    """Print one block, largest first; return the int_bits it needs."""
+    print(f"\n  {title}")
+    w = max(map(len, values))
+    for k, v in sorted(values.items(), key=lambda kv: -kv[1]):
+        print(f"    {k:<{w}}  max|x| = {v:11.4f}   int_bits >= {int_bits_for(v)}")
+    return int_bits_for(max(values.values()))
+
+
+def scan_list(lo: int, hi: int) -> list:
+    """Widths from ``lo`` (>= 1 fractional bit) to ``hi``: lo, lo+1, then even."""
+    return [b for b in range(lo, hi + 1) if b <= lo + 1 or b % 2 == 0]
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--run", required=True, help="trained float run directory")
+    p.add_argument("--dataset", required=True)
+    p.add_argument("--split", default="val", choices=("val", "test"))
+    p.add_argument("--max-jets", type=int, default=200_000,
+                   help="random subsample (maxima need a large sample)")
+    p.add_argument("--max-bits", type=int, default=16, help="widest suggested width")
+    p.add_argument("--out", help="directory for dynamic_range.json")
+    a = p.parse_args()
+
+    run = Path(a.run)
+    _, d = load_run_context(run, load_dataset(a.dataset), a.split)
+    d = subsample(d, a.max_jets)
+    reg = load_regressor(run)
+    print(f"[range] {run.name}: {len(d['y'])} {a.split} jets")
+    kernels, biases = weight_ranges(reg)
+    acts, inputs = activation_ranges(reg, d), input_ranges(d)
+    wi = table("kernels -> weight_int_bits", kernels)
+    ai = table("layer outputs + biases -> act_int_bits", {**acts, **biases})
+    ii = table("standardized inputs -> input_int_bits", inputs)
+
+    # the scanned W/A width is shared, so it starts where the wider integer
+    # part still leaves one fractional bit
+    wa = scan_list(2 + max(wi, ai), a.max_bits)
+    inp = scan_list(2 + ii, a.max_bits)
+    print(f"\n  int bits: weight {wi}, activation {ai}, input {ii} (sign bit separate)"
+          f"\n  suggested:\n    python scripts/quant_scan.py --run {run} "
+          f"--dataset {a.dataset} --split {a.split} \\\n"
+          f"      --weight-bits {' '.join(map(str, wa))} --weight-int-bits {wi} "
+          f"--act-int-bits {ai} \\\n"
+          f"      --input-bits {' '.join(map(str, inp))} --input-int-bits {ii}")
+    if a.out:
+        out = Path(a.out)
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "dynamic_range.json").write_text(json.dumps(
+            {"run": run.name, "kernels": kernels, "biases": biases,
+             "activations": acts, "inputs": inputs,
+             "int_bits": {"weight": wi, "act": ai, "input": ii},
+             "scan": {"weight_bits": wa, "input_bits": inp}}, indent=2) + "\n")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

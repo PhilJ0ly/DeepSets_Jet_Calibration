@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# Philippe Joly, ATLAS Level-0 trigger ML
+# Train every *.json in a config directory in the background, run i pinned to
+# GPU (i mod N_GPUS). Returns immediately; runs survive logout (nohup).
+#
+# Usage: scripts/launch_batch.sh CONFIG_DIR TRAIN_NPZ OUT_DIR [N_GPUS]
+#   logs and a PID registry are written to OUT_DIR/logs/
+
+set -euo pipefail
+[[ $# -ge 3 ]] || { sed -n '3,7p' "$0"; exit 1; }
+CONFIG_DIR=$1; DATASET=$2; OUT_DIR=$3; N_GPUS=${4:-8}
+TRAIN="$(dirname "$0")/train.py"
+
+[[ -f "$DATASET" ]] || { echo "ERROR: dataset not found: $DATASET" >&2; exit 1; }
+shopt -s nullglob
+CONFIGS=("$CONFIG_DIR"/*.json)
+(( ${#CONFIGS[@]} )) || { echo "ERROR: no *.json in $CONFIG_DIR" >&2; exit 1; }
+
+LOG_DIR="$OUT_DIR/logs"
+mkdir -p "$LOG_DIR"
+PIDS="$LOG_DIR/pids.txt"
+echo "# launched $(date -Is) on $(hostname): PID GPU CONFIG" > "$PIDS"
+
+for i in "${!CONFIGS[@]}"; do
+    cfg=${CONFIGS[$i]}; name=$(basename "${cfg%.json}"); gpu=$(( i % N_GPUS ))
+    CUDA_VISIBLE_DEVICES=$gpu nohup python -u "$TRAIN" --config "$cfg" \
+        --dataset "$DATASET" --out-dir "$OUT_DIR" > "$LOG_DIR/$name.log" 2>&1 &
+    echo "$! $gpu $name" | tee -a "$PIDS"
+done
+disown -a
+echo "${#CONFIGS[@]} run(s) -> $OUT_DIR   monitor: tail -f $LOG_DIR/*.log"
+echo "kill all: awk '!/^#/{print \$1}' $PIDS | xargs -r kill"

@@ -1,0 +1,251 @@
+# Philippe Joly, ATLAS Level-0 trigger ML
+"""Performance figures of the report.
+
+Every function takes ``{series label: calibrated pT}``, so one run and an
+overlay of many runs are the same call. Include the "Uncalibrated" and
+"Binned median" series to draw the two references.
+
+    plot_resolution           resolution + median vs truth pT       (Fig. 4.1, 4.3a)
+    plot_resolution_vs_reco   same, binned in uncalibrated pT_EM
+    plot_calibration          2D response maps of one series        (Fig. 2.2)
+    plot_response_spectra     response shapes in truth-pT windows   (Fig. C.1)
+    plot_eta_dependence       median + resolution vs eta            (Fig. C.2)
+    plot_turnon               trigger efficiency vs truth pT        (Fig. 4.3b)
+"""
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Dict, Mapping, Optional, Sequence, Tuple, Union
+
+import numpy as np
+from matplotlib.colors import LogNorm
+
+from jetcal.metrics import (MIN_PER_BIN, binned, binned_quantile,
+                            equal_count_bins, iqr_over_2med, log_bins,
+                            summarize_turnon, turnon_curves)
+from jetcal.style import (FS_ANNOT, FS_LEGEND, IQR_STYLE, MEDIAN_STYLE, MS,
+                          annotate_bins, atlas_label, bin_width_note,
+                          draw_ideal, plt, save, series_styles, tex_label,
+                          tidy_log_axis)
+
+#: truth-pT windows shared by the spectra and eta figures [GeV]
+PT_SLICES: Tuple[Tuple[float, float], ...] = ((10.0, 50.0), (50.0, 80.0), (80.0, 800.0))
+_RES_LABEL = r"Response IQR / (2 $\times$ median)"
+_RESP_LABEL = r"$p_\mathrm{T}^\mathrm{calib} / p_\mathrm{T}^\mathrm{true}$"
+PathLike = Optional[Union[str, Path]]
+
+
+def _slice_text(lo: float, hi: float) -> str:
+    return rf"${lo:.0f} \leq p_\mathrm{{T}}^\mathrm{{true}} < {hi:.0f}$ GeV"
+
+
+def _resolution_vs(x: np.ndarray, predictions: Mapping[str, np.ndarray],
+                   pt_true: np.ndarray, xlabel: str, note_name: str,
+                   n_bins: int, save_path: PathLike) -> plt.Figure:
+    """Resolution (top) and median response (bottom) in equal-population bins of x."""
+    x, pt_true = np.asarray(x, np.float64), np.asarray(pt_true, np.float64)
+    edges = equal_count_bins(x, n_bins)
+    centers = np.sqrt(edges[:-1] * edges[1:])
+    fig, (ax_res, ax_med) = plt.subplots(2, 1, figsize=(18, 9), sharex=True,
+                                         gridspec_kw=dict(height_ratios=(2, 1),
+                                                          hspace=0.06))
+    st = series_styles(predictions)
+    for lab, pt in predictions.items():
+        r = np.asarray(pt, np.float64) / pt_true
+        ax_res.plot(centers, binned(x, r, edges, iqr_over_2med), marker="o",
+                    ms=MS, label=lab, **st[lab])
+        ax_med.plot(centers, binned(x, r, edges, "median"), marker="o", ms=MS, **st[lab])
+    ax_res.set_ylabel(_RES_LABEL)
+    ax_res.set_ylim(bottom=0)
+    ax_res.legend(fontsize=FS_LEGEND, ncol=2)
+    atlas_label(ax_res, FS_ANNOT + 2)
+    annotate_bins(ax_res, bin_width_note(edges, "GeV", note_name) + " (equal population)",
+                  loc="upper right")
+    draw_ideal(ax_med, "h", 1.0)
+    ax_med.set_xscale("log")
+    tidy_log_axis(ax_med)
+    ax_med.set_xlim(edges[0], edges[-1])
+    ax_med.set_xlabel(xlabel)
+    ax_med.set_ylabel("Median response")
+    save(fig, save_path)
+    return fig
+
+
+def plot_resolution(predictions: Mapping[str, np.ndarray], pt_true: np.ndarray,
+                    n_bins: int = 25, save_path: PathLike = None) -> plt.Figure:
+    """Resolution and median response vs truth pT."""
+    return _resolution_vs(pt_true, predictions, pt_true, tex_label("pt_true", "GeV"),
+                          tex_label("pt_true"), n_bins, save_path)
+
+
+def plot_resolution_vs_reco(predictions: Mapping[str, np.ndarray],
+                            pt_reco: np.ndarray, pt_true: np.ndarray,
+                            n_bins: int = 18, save_path: PathLike = None) -> plt.Figure:
+    """Resolution and median response vs uncalibrated pT_EM.
+
+    Binning in the observable removes the IQR narrowing that a steep
+    correction produces in truth-pT bins (prior shrinkage).
+    """
+    return _resolution_vs(pt_reco, predictions, pt_true, tex_label("pt_EM", "GeV"),
+                          tex_label("pt_EM"), n_bins, save_path)
+
+
+def plot_calibration(pt_true: np.ndarray, pt_pred: np.ndarray, eta: np.ndarray,
+                     label: str = "calib", save_path: PathLike = None) -> plt.Figure:
+    """Response vs truth pT, response vs eta, and pT_pred vs truth pT (2D maps).
+
+    Solid red: binned median; dotted blue: 16/84% quantiles; dashed grey: ideal.
+    """
+    pt_true, pt_pred, eta = (np.asarray(a, np.float64) for a in (pt_true, pt_pred, eta))
+    r = pt_pred / pt_true
+    tag = label.replace("_", r"\_")
+    resp = rf"$p_\mathrm{{T}}^\mathrm{{{tag}}} / p_\mathrm{{T}}^\mathrm{{true}}$"
+    r_edges = np.linspace(max(0.0, 0.8 * np.quantile(r, 0.001)),
+                          min(3.0, 1.2 * np.quantile(r, 0.999)), 80)
+    pt_edges = log_bins(pt_true, 50)
+    pp_edges = log_bins(np.concatenate([pt_true, pt_pred]), 50)  # pT_pred vs pT_true axes
+    s_edges = equal_count_bins(pt_true, 30)
+    s_cent = np.sqrt(s_edges[:-1] * s_edges[1:])
+    eta_edges = np.linspace(eta.min(), eta.max(), 40)
+    eta_cent = 0.5 * (eta_edges[:-1] + eta_edges[1:])
+    pt_clip = np.clip(pt_pred, pp_edges[0], pp_edges[-1])
+
+    fig, axes = plt.subplots(1, 3, figsize=(26, 7.5), layout="constrained")
+    panels = ((pt_true, r, pt_edges, r_edges, s_edges, s_cent, resp),
+              (eta, r, eta_edges, r_edges, eta_edges, eta_cent, resp),
+              (pt_true, pt_clip, pp_edges, pp_edges, s_edges, s_cent,
+               rf"$p_\mathrm{{T}}^\mathrm{{{tag}}}$ [GeV]"))
+    for i, (ax, (x, y, xe, ye, se, sc, ylab)) in enumerate(zip(axes, panels)):
+        h = ax.hist2d(x, y, bins=[xe, ye], norm=LogNorm(), cmap="viridis", density=True)
+        ax.plot(sc, binned(x, y, se, "median"), label="Median", **MEDIAN_STYLE)
+        for q, lab in ((0.16, "IQR (16 / 84%)"), (0.84, None)):
+            ax.plot(sc, binned_quantile(x, y, se, q), label=lab, **IQR_STYLE)
+        if i < 2:
+            draw_ideal(ax, "h", 1.0, label="Ideal")
+        else:
+            draw_ideal(ax, "diag", xy=(xe[[0, -1]], xe[[0, -1]]), label="Ideal")
+            ax.set_yscale("log")
+            tidy_log_axis(ax, "y")
+        if i != 1:
+            ax.set_xscale("log")
+            tidy_log_axis(ax)
+        ax.set_xlim(xe[0], xe[-1])
+        ax.set_ylim(ye[0], ye[-1])
+        ax.set_xlabel(tex_label("eta_true") if i == 1 else tex_label("pt_true", "GeV"))
+        ax.set_ylabel(ylab)
+        ax.legend(loc="upper left" if i == 2 else "upper right", fontsize=FS_LEGEND - 2)
+        annotate_bins(ax, bin_width_note(xe, "" if i == 1 else "GeV", "x"),
+                      bin_width_note(ye, "GeV" if i == 2 else "", "y"),
+                      loc="lower right" if i == 2 else "lower left")
+        fig.colorbar(h[3], ax=ax, pad=0.02, label="Jet density")
+    atlas_label(axes[0])
+    save(fig, save_path)
+    return fig
+
+
+def plot_response_spectra(predictions: Mapping[str, np.ndarray], pt_true: np.ndarray,
+                          slices: Sequence[Tuple[float, float]] = PT_SLICES,
+                          n_bins: int = 60, save_path: PathLike = None) -> plt.Figure:
+    """Unit-area response histograms (log y), one panel per truth-pT window."""
+    pt_true = np.asarray(pt_true, np.float64)
+    fig, axes = plt.subplots(1, len(slices), figsize=(7.2 * len(slices), 6.4),
+                             gridspec_kw=dict(wspace=0.22))
+    axes = np.atleast_1d(axes)
+    st = series_styles(predictions)
+    for ax, (lo, hi) in zip(axes, slices):
+        m = (pt_true >= lo) & (pt_true < hi)
+        ax.set_xlabel(_RESP_LABEL)
+        if m.sum() < MIN_PER_BIN:
+            ax.text(0.5, 0.5, "insufficient\nstatistics", ha="center",
+                    transform=ax.transAxes, color="gray")
+            continue
+        rs = {lab: np.asarray(p, np.float64)[m] / pt_true[m]
+              for lab, p in predictions.items()}
+        edges = np.linspace(*np.quantile(np.concatenate(list(rs.values())),
+                                         [0.001, 0.999]), n_bins + 1)
+        for lab, r in rs.items():
+            ax.hist(np.clip(r, edges[0], edges[-1]), bins=edges, density=True,
+                    histtype="step", label=lab, **st[lab])
+        draw_ideal(ax, "v", 1.0)
+        ax.set_yscale("log")
+        ax.text(0.97, 0.97, _slice_text(lo, hi), transform=ax.transAxes,
+                ha="right", va="top", fontsize=FS_ANNOT + 1)
+        annotate_bins(ax, bin_width_note(edges, "", "Response"), loc="lower left")
+    axes[0].set_ylabel("Normalized jets / bin")
+    axes[0].legend(fontsize=FS_LEGEND - 2, loc="lower right")
+    atlas_label(axes[0])
+    save(fig, save_path)
+    return fig
+
+
+def plot_eta_dependence(predictions: Mapping[str, np.ndarray], pt_true: np.ndarray,
+                        eta_true: np.ndarray,
+                        slices: Sequence[Tuple[float, float]] = PT_SLICES,
+                        n_bins: int = 16, save_path: PathLike = None) -> plt.Figure:
+    """Median response (top) and resolution (bottom) in equal-width eta bins."""
+    pt_true, eta_true = np.asarray(pt_true, np.float64), np.asarray(eta_true, np.float64)
+    edges = np.linspace(eta_true.min(), eta_true.max(), n_bins + 1)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    fig, axes = plt.subplots(2, len(slices), figsize=(7.0 * len(slices), 9.0),
+                             sharex=True, sharey="row",
+                             gridspec_kw=dict(hspace=0.07, wspace=0.08))
+    axes = np.asarray(axes).reshape(2, len(slices))
+    st = series_styles(predictions)
+    for j, (lo, hi) in enumerate(slices):
+        m = (pt_true >= lo) & (pt_true < hi)
+        for lab, pt in predictions.items():
+            r = np.asarray(pt, np.float64)[m] / pt_true[m]
+            axes[0, j].plot(centers, binned(eta_true[m], r, edges, "median"),
+                            marker="o", ms=MS - 1, label=lab, **st[lab])
+            axes[1, j].plot(centers, binned(eta_true[m], r, edges, iqr_over_2med),
+                            marker="o", ms=MS - 1, **st[lab])
+        draw_ideal(axes[0, j], "h", 1.0)
+        axes[0, j].text(0.97, 0.06, _slice_text(lo, hi), transform=axes[0, j].transAxes,
+                        ha="right", va="bottom", fontsize=FS_ANNOT + 1)
+        axes[1, j].set_xlabel(tex_label("eta_true"))
+    axes[0, 0].set_ylabel("Median response")
+    axes[1, 0].set_ylabel(_RES_LABEL)
+    axes[0, 0].legend(fontsize=FS_LEGEND - 3, ncol=2, loc="lower left")
+    annotate_bins(axes[1, 0], bin_width_note(edges, "", tex_label("eta_true")))
+    atlas_label(axes[0, 0])
+    save(fig, save_path)
+    return fig
+
+
+def plot_turnon(predictions: Mapping[str, np.ndarray], pt_true: np.ndarray,
+                threshold_pt: float = 100.0, n_bins: int = 30,
+                save_path: PathLike = None
+                ) -> Tuple[plt.Figure, Dict[str, Dict[str, float]]]:
+    """Single-jet turn-on: every series cut at ``threshold_pt`` on its own pT.
+
+    A calibration that closes crosses 50% at the threshold; the accept
+    fraction of each series is quoted in the legend.
+
+    Returns:
+        ``(figure, {series: {threshold, accept_fraction, pt50, pt95, pt99,
+        sharpness}})``.
+    """
+    edges, centers, curves, thr, rates = turnon_curves(
+        predictions, pt_true, threshold_pt=threshold_pt, n_bins=n_bins)
+    fig, ax = plt.subplots(figsize=(16, 7))
+    st = series_styles(predictions)
+    summary = {}
+    for lab, eff in curves.items():
+        ax.plot(centers, eff, marker="o", ms=MS, label=f"{lab}  ({rates[lab]:.2%})",
+                **st[lab])
+        summary[lab] = summarize_turnon(centers, eff, thr[lab], rates[lab])
+    ax.axvline(threshold_pt, color="0.35", ls=":", lw=1.4, zorder=1)
+    draw_ideal(ax, "h", 1.0)
+    ax.set_xscale("log")
+    tidy_log_axis(ax)
+    ax.set_xlim(edges[0], edges[-1])
+    ax.set_ylim(0, 1.12)
+    ax.set_xlabel(tex_label("pt_true", "GeV"))
+    ax.set_ylabel("Trigger efficiency")
+    ax.legend(fontsize=FS_LEGEND, loc="lower right",
+              title=f"single jet > {threshold_pt:g} GeV (accept fraction)",
+              title_fontsize=FS_LEGEND - 2)
+    annotate_bins(ax, bin_width_note(edges, "GeV", tex_label("pt_true")))
+    atlas_label(ax, FS_ANNOT + 2)
+    save(fig, save_path)
+    return fig, summary

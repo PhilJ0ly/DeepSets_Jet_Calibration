@@ -1,0 +1,97 @@
+#!/usr/bin/env python3
+# Philippe Joly, ATLAS Level-0 trigger ML
+"""Post-training quantization bit scans of one trained float run (no retraining).
+
+Step 2 of the PTQ workflow: with the integer bits fixed from
+scripts/dynamic_range.py, scan the total width of
+    weights + activations (inputs float),
+    all inputs together (model float),
+    each input alone (bit allocation),
+and draw the fixed-vs-float fidelity at one operating point.
+
+Outputs (in --out, default <run>/quant_scan):
+    <split>_quant_scan.json, <split>_quant_weight_scan, <split>_quant_input_scan,
+    <split>_quant_bit_allocation, <split>_quant_fidelity
+
+Example:
+    python scripts/quant_scan.py --run runs/scan_3x8 --dataset $TEST \\
+        --weight-bits 8 10 12 14 16 --weight-int-bits 2 --act-int-bits 6 \\
+        --input-bits 6 8 10 12 14 16 --input-int-bits 3 \\
+        --fidelity-weight-bits 16 --fidelity-input-bits 12 --fidelity-rate 0.15
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from jetcal.config import QuantConfig  # noqa: E402
+from jetcal.data import load_dataset, subsample  # noqa: E402
+from jetcal.evaluation import calibrated_pt, load_run_context  # noqa: E402
+from jetcal.models import load_regressor  # noqa: E402
+from jetcal.quantization import (plot_bit_allocation, plot_quant_fidelity,  # noqa: E402
+                                 plot_quant_scan, quantize_inputs, run_quant_scans)
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--run", required=True, help="trained float run directory")
+    p.add_argument("--dataset", required=True)
+    p.add_argument("--split", default="test", choices=("val", "test"))
+    p.add_argument("--weight-bits", type=int, nargs="+", default=[8, 10, 12, 14, 16])
+    p.add_argument("--act-bits", type=int, help="pin the activation width (default: = weights)")
+    p.add_argument("--input-bits", type=int, nargs="+", default=[6, 8, 10, 12, 14, 16])
+    p.add_argument("--weight-int-bits", type=int, required=True)
+    p.add_argument("--act-int-bits", type=int, required=True)
+    p.add_argument("--input-int-bits", type=int, required=True)
+    p.add_argument("--rate-fraction", type=float, default=0.05,
+                   help="accept fraction for the equal-rate sharpness and migration")
+    p.add_argument("--no-allocation", action="store_true", help="skip the per-feature scan")
+    p.add_argument("--max-jets", type=int, help="random subsample bound")
+    p.add_argument("--fidelity-weight-bits", type=int, default=16,
+                   help="weight and activation width of the fidelity point")
+    p.add_argument("--fidelity-input-bits", type=int, default=12)
+    p.add_argument("--fidelity-rate", type=float, default=0.15,
+                   help="accept fraction quoted for the fidelity migration")
+    p.add_argument("--out")
+    a = p.parse_args()
+
+    run = Path(a.run)
+    out = Path(a.out) if a.out else run / "quant_scan"
+    out.mkdir(parents=True, exist_ok=True)
+    dataset = load_dataset(a.dataset)
+    rec = run_quant_scans(run, dataset, a.split, a.weight_bits, a.input_bits, a.act_bits,
+                          a.weight_int_bits, a.act_int_bits, a.input_int_bits,
+                          per_feature=not a.no_allocation,
+                          rate_fraction=a.rate_fraction, max_jets=a.max_jets)
+    (out / f"{a.split}_quant_scan.json").write_text(json.dumps(rec, indent=2) + "\n")
+    plot_quant_scan(rec, "weight_scan", out / f"{a.split}_quant_weight_scan")
+    plot_quant_scan(rec, "input_scan", out / f"{a.split}_quant_input_scan")
+    if not a.no_allocation:
+        plot_bit_allocation(rec, out / f"{a.split}_quant_bit_allocation")
+
+    # fidelity: weights, activations and inputs quantized together
+    _, d = load_run_context(run, dataset, a.split)
+    d = subsample(d, a.max_jets)
+    wb, ab = a.fidelity_weight_bits, a.act_bits or a.fidelity_weight_bits
+    q = QuantConfig(mode="ptq", weight_bits=wb, weight_int_bits=a.weight_int_bits,
+                    act_bits=ab, act_int_bits=a.act_int_bits,
+                    input_phi_bits=a.fidelity_input_bits,
+                    input_glob_bits=a.fidelity_input_bits,
+                    input_int_bits=a.input_int_bits)
+    pt_float = calibrated_pt(load_regressor(run, QuantConfig()), d)
+    pt_q = calibrated_pt(load_regressor(run, q), quantize_inputs(d, q))
+    plot_quant_fidelity(pt_q, pt_float, d["pt_true"], a.fidelity_rate,
+                        label=f"W Q({wb},{a.weight_int_bits}), A Q({ab},{a.act_int_bits}), "
+                              f"in Q({a.fidelity_input_bits},{a.input_int_bits})",
+                        save_path=out / f"{a.split}_quant_fidelity")
+    print(f"[quant] done -> {out}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

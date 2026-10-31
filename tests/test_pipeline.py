@@ -1,0 +1,211 @@
+#!/usr/bin/env python3
+# Philippe Joly, ATLAS Level-0 trigger ML
+"""End-to-end check of the whole pipeline on synthetic jets (CPU, a few minutes).
+
+Unit checks (fixed-point math, config round trip, ROOT feature building on
+in-memory awkward arrays) followed by every command-line step of the README
+on a toy dataset, in order. Exits non-zero on the first failure.
+
+Usage:
+    python tests/test_pipeline.py [--keep DIR]
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+import numpy as np
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+_N_CHECKS = 0
+
+
+def check(cond: bool, what: str) -> None:
+    """Assert with a readable PASS/FAIL line."""
+    global _N_CHECKS
+    _N_CHECKS += 1
+    print(f"  [{'PASS' if cond else 'FAIL'}] {what}")
+    if not cond:
+        raise SystemExit(f"FAILED: {what}")
+
+
+def run(*args: str) -> None:
+    """Run a repository script; fail loudly with its output."""
+    cmd = [sys.executable, str(ROOT / "scripts" / args[0]), *args[1:]]
+    print(f"\n$ {' '.join(cmd[1:])}")
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    tail = "\n".join((res.stdout + res.stderr).strip().splitlines()[-12:])
+    print("    " + tail.replace("\n", "\n    "))
+    check(res.returncode == 0, f"{args[0]} exits 0")
+
+
+# ------------------------------------------------------------------- units
+
+def test_units() -> None:
+    print("\n== unit checks")
+    from jetcal.config import QuantConfig, RunConfig
+    from jetcal.quantization import quantize_array
+
+    q = quantize_array(np.array([0.3, -5.0, 5.0, 1.26]), bits=6, int_bits=2)
+    check(np.allclose(q, [0.25, -4.0, 3.875, 1.25]), "Q(6,2): round to 1/8, saturate at [-4, 3.875]")
+    cfg = RunConfig.load(ROOT / "configs" / "trigger_tiny.json")
+    check(RunConfig.from_dict(cfg.to_dict()) == cfg, "RunConfig JSON round trip")
+    legacy = cfg.to_dict()
+    legacy["model"].update(backend="energyflow", pooling=["sum"], l2=0.0)
+    check(RunConfig.from_dict(legacy) == cfg, "legacy config keys are ignored")
+    for bad in ({"model": {"backend": "deepsets"}}, {"quant": {"mode": "qat"}},
+                {"model": {"phi_size": [8]}}):
+        try:
+            RunConfig.from_dict(bad)
+            ok = False
+        except (KeyError, ValueError):
+            ok = True
+        check(ok, f"rejects {bad}")
+    check(not QuantConfig(mode="ptq", input_phi_bits=8).graph_quant
+          and QuantConfig(mode="ptq", input_phi_bits=8).input_quant, "QuantConfig switches")
+
+
+def test_root_features() -> None:
+    print("\n== ROOT feature building (in-memory awkward arrays)")
+    import awkward as ak
+    from jetcal.root_processing import (ProcessingConfig, build_features,
+                                        file_stats, jet_selection,
+                                        merge_stats, plot_selection_qa)
+    cfg = ProcessingConfig(calib="J", max_const=4)
+    b = ak.Array({
+        "J_pt": [[50.0, 8.0], [120.0]], "J_eta": [[0.5, -1.0], [2.0]],
+        "J_phi": [[0.1, 3.0], [-3.1]], "J_m": [[5.0, 1.0], [10.0]],
+        "J_nConstituents": [[2, 1], [3]],
+        "J_constituentPt": [[[30.0, 20.0], [8.0]], [[60.0, 40.0, 20.0]]],
+        "J_constituentEta": [[[0.4, 0.6], [-1.0]], [[2.1, 1.9, 2.0]]],
+        "J_constituentPhi": [[[0.0, 0.2], [3.0]], [[3.1, -3.1, -3.0]]],
+        "J_matchedTruth_pt": [[60.0, 5.0], [150.0]],
+        "J_matchedTruth_eta": [[0.5, -1.0], [2.0]],
+        "averageInteractionsPerCrossing": [200.0, 190.0],
+        "runNumber": [1, 1], "eventNumber": [10, 11]})
+    keep = jet_selection(b, cfg)
+    part = build_features(b, keep, cfg)
+    check(part["x_phi"].shape == (2, 4, 8), "selected 2 of 3 jets, 8 constituent features")
+    check(np.allclose(part["mask"].sum(1), [2, 3]), "constituent masks")
+    check(np.allclose(part["x_phi"][1, 2, 6], np.sin(-3.0 + 3.1), atol=1e-5),
+          "sin(dphi) wraps across +-pi")
+    check(np.allclose(part["y"][:, 0], np.log([60 / 50, 150 / 120])), "target log(pT_true/pT_EM)")
+    stats = merge_stats([file_stats("f", b, keep, cfg)])
+    check((stats.n_jets, stats.n_matched, stats.n_pass, stats.n_events) == (3, 3, 2, 2),
+          "book-keeping: jets / matched / selected / events")
+    with tempfile.TemporaryDirectory() as tmp:
+        plot_selection_qa(stats, tmp, cfg)
+        check(Path(tmp, "J_selection_qa.png").is_file(), "selection QA figure")
+
+
+# -------------------------------------------------------------- end to end
+
+def test_cli(work: Path) -> None:
+    print(f"\n== command-line pipeline in {work}")
+    data, runs = work / "data", work / "runs"
+    train, test = data / "toy_train.npz", data / "toy_test.npz"
+    run("process_data.py", "--toy", "40000", "--out-dir", str(data), "--calib", "toy")
+    check(train.is_file() and test.is_file(), "toy train/test datasets written")
+
+    cfgs = work / "configs"
+    cfgs.mkdir(exist_ok=True)
+    for name in ("trigger_tiny", "offline_reference"):
+        cfg = json.loads((ROOT / "configs" / f"{name}.json").read_text())
+        cfg["training"].update(epochs=6, verbose=0)
+        if name == "offline_reference":  # keep the CPU test fast
+            cfg["model"].update(phi_sizes=[32, 32], f_sizes=[32, 32])
+        (cfgs / f"{name}.json").write_text(json.dumps(cfg))
+        run("train.py", "--config", str(cfgs / f"{name}.json"), "--dataset", str(train),
+            "--out-dir", str(runs))
+    tiny = runs / "trigger_tiny"
+    for f in ("config.json", "model_spec.json", "model.weights.h5", "baseline.json"):
+        check((tiny / f).is_file(), f"run artifact {f}")
+
+    run("evaluate.py", "--runs", str(runs), "--labels", "Offline", "Tiny",
+        "--dataset", str(test), "--out", str(work / "summary"), "--threshold", "60")
+    metrics = json.loads((work / "summary" / "test_metrics.json").read_text())
+    res = {k: v["resolution_iqr"] for k, v in metrics.items()}
+    print(f"    resolution: {res}")
+    check(res["Offline"] < res["Binned median"], "the model out-resolves the binned median")
+    check(abs(metrics["Binned median"]["median_response"] - 1) < 0.02,
+          "binned median closes")
+    for fig in ("resolution", "resolution_vs_reco", "response_spectra", "eta_dependence",
+                "turnon_60GeV", "uncalibrated_calibration"):
+        check((work / "summary" / f"test_{fig}.png").is_file(), f"figure test_{fig}")
+
+    run("dynamic_range.py", "--run", str(tiny), "--dataset", str(train), "--split", "val",
+        "--out", str(work / "range"))
+    ib = json.loads((work / "range" / "dynamic_range.json").read_text())["int_bits"]
+    qs = work / "qscan"
+    run("quant_scan.py", "--run", str(tiny), "--dataset", str(test),
+        "--weight-bits", "10", "14", "24", "--input-bits", "8", "12", "24",
+        "--weight-int-bits", str(ib["weight"]), "--act-int-bits", str(ib["act"]),
+        "--input-int-bits", str(ib["input"]), "--max-jets", "4000", "--out", str(qs))
+    scan = json.loads((qs / "test_quant_scan.json").read_text())
+    check(scan["weight_scan"][-1]["rel_dev_q95"] < 1e-3,
+          "24-bit weights/activations reproduce the float model")
+    check(scan["input_scan"][-1]["rel_dev_q95"] < 1e-3, "24-bit inputs reproduce the float model")
+    check(set(scan["allocation"]) == {"log_pt_c", "eta_c", "log_pt_reco", "abs_eta", "eta",
+                                      "log_m_over_pt"}, "one allocation curve per input")
+    for fig in ("weight_scan", "input_scan", "bit_allocation", "fidelity"):
+        check((qs / f"test_quant_{fig}.png").is_file(), f"figure test_quant_{fig}")
+
+    ptq = runs / "trigger_tiny_ptq"
+    run("make_ptq.py", "--run", str(tiny), "--out", str(ptq),
+        "--weight-bits", "16", "--weight-int-bits", str(ib["weight"]),
+        "--act-bits", "16", "--act-int-bits", str(ib["act"]),
+        "--input-bits", "12", "--input-int-bits", str(ib["input"]))
+    run("evaluate.py", "--runs", str(tiny), str(ptq), "--dataset", str(test),
+        "--out", str(work / "summary_ptq"), "--threshold", "60")
+    m = json.loads((work / "summary_ptq" / "test_metrics.json").read_text())
+    d_iqr = abs(m["trigger_tiny_ptq"]["resolution_iqr"] - m["trigger_tiny"]["resolution_iqr"])
+    check(0 < d_iqr < 0.01, f"PTQ at 16/12 bits is close to, not identical to, float ({d_iqr:.1e})")
+
+    imp = work / "importance"
+    run("feature_importance.py", "--run", str(tiny), "--dataset", str(test),
+        "--config", str(ROOT / "configs" / "importance" / "importance.json"),
+        "--groups", str(ROOT / "configs" / "importance" / "groups_trigger.json"),
+        "--max-jets", "3000", "--out", str(imp))
+    rec = json.loads((imp / "test_importance.json").read_text())
+    check(rec["null_test"]["max_abs_rel_dev"] < 1e-4, "PFN is permutation invariant")
+    check(rec["ig_completeness"]["dataset"] < 0.02, "Expected Gradients completeness < 2%")
+    for fig in ("ranking", "beeswarm", "vs_pt"):
+        check((imp / f"test_importance_{fig}.png").is_file(), f"figure test_importance_{fig}")
+
+    abl_cfg, abl_runs = work / "abl_configs", work / "abl_runs"
+    run("feature_importance.py", "--run", str(tiny), "--dataset", str(test),
+        "--ablation-configs", str(abl_cfg), "--ablation-seeds", "0")
+    for f in sorted(abl_cfg.glob("abl_*glob_eta_s0.json")) + sorted(abl_cfg.glob("abl_full*")):
+        run("train.py", "--config", str(f), "--dataset", str(train),
+            "--out-dir", str(abl_runs), "--epochs", "2")
+    run("feature_importance.py", "--run", str(tiny), "--dataset", str(test),
+        "--max-jets", "2000", "--ablation-runs", str(abl_runs), "--out", str(imp))
+    check((imp / "test_importance_ablation.png").is_file(), "figure test_importance_ablation")
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--keep", help="write outputs here instead of a temporary directory")
+    a = p.parse_args()
+    t0 = time.time()
+    test_units()
+    test_root_features()
+    if a.keep:
+        Path(a.keep).mkdir(parents=True, exist_ok=True)
+        test_cli(Path(a.keep))
+    else:
+        with tempfile.TemporaryDirectory() as tmp:
+            test_cli(Path(tmp))
+    print(f"\nALL {_N_CHECKS} CHECKS PASSED in {time.time() - t0:.0f}s")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

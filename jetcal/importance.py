@@ -1,0 +1,634 @@
+# Philippe Joly, ATLAS Level-0 trigger ML
+"""Input relevance: which constituent and jet features drive the calibration.
+
+Four probes, each answering a different question:
+
+    expected gradients   what the trained network uses, per jet, on one
+                         additive scale for constituent and jet inputs
+    permutation (PFI)    how much the figure of merit (FOM) depends on the
+                         feature's association with the target
+    occlusion            the feature held at its training mean, no retraining
+    ablation             the feature removed and the model RETRAINED (decisive)
+
+Conventions
+    * Attributions are in target units: for log(pT_true/pT_EM) an attribution
+      of 0.01 moves that jet's calibrated pT by +1%.
+    * The mask is structure, not a feature: it is held fixed along every path
+      and after every permutation, so pads carry zero attribution.
+    * FOMs are "smaller is better"; a positive delta is a degradation.
+"""
+from __future__ import annotations
+
+import dataclasses
+import json
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
+
+import numpy as np
+import tensorflow as tf
+from scipy.cluster.hierarchy import fcluster, linkage
+from scipy.spatial.distance import squareform
+from scipy.stats import spearmanr
+
+from jetcal.evaluation import calibrated_pt
+from jetcal.metrics import equal_count_bins, iqr_over_2med
+from jetcal.style import (FS_ANNOT, FS_LEGEND, FS_TICK, LW, MS, annotate_bins,
+                          atlas_label, bin_width_note, draw_ideal, plt, save,
+                          tex_label, tex_labels)
+
+VALID_METHODS = ("ig", "pfi", "occlusion")
+VALID_FOMS = ("resolution_iqr", "closure_abs", "log_response_rmse")
+_LEVEL_COLOR = {"const": "#0072b2", "glob": "#d55e00"}
+_PALETTE = ("#0072b2", "#d55e00", "#009e73", "#cc79a7", "#e69f00", "#56b4e9",
+            "#7f7f7f", "#000000")
+
+
+@dataclass
+class ImportanceConfig:
+    """Settings of one relevance study.
+
+    Attributes:
+        methods: Subset of ``("ig", "pfi", "occlusion")``.
+        ig_steps: Path points of the gradient integral (midpoint rule).
+        ig_baselines: Reference-jet pool for Expected Gradients (0 = zero
+            baseline, not recommended: the PFN reads an all-zero row as padding).
+        ig_batch / ig_check_jets: Jets per gradient batch / completeness check.
+        pfi_repeats: Permutations per feature.
+        pfi_strata: Permute within this many reco-pT strata (>1 asks "what
+            does the feature add beyond jet pT?").
+        fom: Figures of merit; the first drives the figures.
+        n_bootstrap: Bootstrap replicas for the error bars.
+        n_pt_bins: Equal-population reco-pT bins of the differential figure.
+        groups: ``{name: ["const:x", "glob:y", ...]}`` permuted together.
+        auto_group: Correlation-distance cut for automatic grouping (0 = off).
+        max_jets: Random subsample bound.
+        seed: RNG seed.
+        beeswarm_jets: Jets drawn in the signed-response figure.
+    """
+
+    methods: tuple = VALID_METHODS
+    ig_steps: int = 32
+    ig_baselines: int = 64
+    ig_batch: int = 256
+    ig_check_jets: int = 512
+    pfi_repeats: int = 5
+    pfi_strata: int = 1
+    fom: tuple = VALID_FOMS
+    n_bootstrap: int = 100
+    n_pt_bins: int = 6
+    groups: Optional[dict] = None
+    auto_group: float = 0.0
+    max_jets: Optional[int] = 50_000
+    seed: int = 0
+    beeswarm_jets: int = 2_000
+
+    def __post_init__(self) -> None:
+        self.methods, self.fom = tuple(self.methods), tuple(self.fom)
+        for name, valid in (("methods", VALID_METHODS), ("fom", VALID_FOMS)):
+            got = getattr(self, name)
+            if not got or set(got) - set(valid):
+                raise ValueError(f"{name}={got}; use a non-empty subset of {valid}")
+        for name in ("ig_steps", "ig_batch", "pfi_repeats", "pfi_strata",
+                     "n_bootstrap", "n_pt_bins"):
+            if int(getattr(self, name)) < 1:
+                raise ValueError(f"{name} must be >= 1")
+        if not 0.0 <= self.auto_group < 1.0:
+            raise ValueError("auto_group must be in [0, 1)")
+
+    @classmethod
+    def from_dict(cls, d: Mapping) -> "ImportanceConfig":
+        unknown = set(d) - {f.name for f in dataclasses.fields(cls)}
+        if unknown:
+            raise KeyError(f"unknown importance config keys: {sorted(unknown)}")
+        return cls(**dict(d))
+
+
+# ------------------------------------------------------------------ helpers
+
+def feature_names(d: Mapping) -> List[str]:
+    """``"const:<label>"`` / ``"glob:<label>"`` for every input, constituents first."""
+    return [f"const:{l}" for l in d["phi_lbls"]] + [f"glob:{l}" for l in d["glob_lbls"]]
+
+
+def _level(name: str) -> str:
+    return name.split(":", 1)[0]
+
+
+def _fom(pt_pred: np.ndarray, pt_true: np.ndarray, key: str) -> float:
+    r = np.asarray(pt_pred, np.float64) / pt_true
+    if key == "resolution_iqr":
+        return iqr_over_2med(r)
+    if key == "closure_abs":
+        return abs(float(np.median(r)) - 1.0)
+    return float(np.sqrt(np.mean(np.log(np.maximum(r, 1e-12)) ** 2)))
+
+
+def figures_of_merit(pt_pred: np.ndarray, pt_true: np.ndarray) -> Dict[str, float]:
+    return {k: _fom(pt_pred, pt_true, k) for k in VALID_FOMS}
+
+
+def _paired_bootstrap(pt_var: Sequence[np.ndarray], pt_nom: np.ndarray,
+                      pt_true: np.ndarray, key: str, n_boot: int,
+                      rng: np.random.Generator) -> float:
+    """Std of FOM(varied) - FOM(nominal) over paired jet resamples."""
+    n, deltas = len(pt_true), []
+    for _ in range(n_boot):
+        idx = rng.integers(0, n, n)
+        pv = pt_var[int(rng.integers(len(pt_var)))]
+        deltas.append(_fom(pv[idx], pt_true[idx], key) - _fom(pt_nom[idx], pt_true[idx], key))
+    return float(np.std(deltas, ddof=1))
+
+
+# --------------------------------------------------------- expected gradients
+
+def _baseline(d: dict, sl: slice, pool: Optional[np.ndarray],
+              rng: np.random.Generator) -> Tuple[np.ndarray, np.ndarray]:
+    """Path start for one jet slice: origin (pool=None) or a random real jet.
+
+    Donor values are copied only where donor AND receiver hold a real
+    constituent, so no baseline row is accidentally all-zero (which the PFN
+    would read as padding, breaking completeness).
+    """
+    if pool is None:
+        return np.zeros_like(d["x_phi"][sl]), np.zeros_like(d["x_glob"][sl])
+    donors = rng.choice(pool, size=sl.stop - sl.start)
+    keep = np.asarray(d["mask"][sl], bool) & np.asarray(d["mask"][donors], bool)
+    b_phi = np.where(keep[..., None], d["x_phi"][donors], d["x_phi"][sl])
+    return (np.asarray(b_phi * d["mask"][sl][..., None], np.float32),
+            np.asarray(d["x_glob"][donors], np.float32))
+
+
+def integrated_gradients(reg: Any, d: dict, cfg: ImportanceConfig,
+                         verbose: bool = True) -> Dict[str, np.ndarray]:
+    """Per-jet attributions (target units) of every input.
+
+    Integrates the output gradient from a baseline to the jet with midpoints
+    ``(k + 1/2)/m``; with ``ig_baselines > 0`` the baseline is redrawn from
+    real jets at every point (Expected Gradients). Constituent attributions
+    are summed over the set, the only well-defined reduction for a
+    permutation-invariant model.
+
+    Returns:
+        ``{"phi" (N,C,P), "glob" (N,G), "f_x", "f_base" (N,), "completeness",
+        "completeness_dataset"}``.
+    """
+    n, c, p = d["x_phi"].shape
+    g = d["x_glob"].shape[-1]
+    scale = float(np.ravel(d["norm"]["y"]["std"])[0])
+    rng = np.random.default_rng(cfg.seed)
+    pool = rng.choice(n, min(cfg.ig_baselines, n), replace=False) if cfg.ig_baselines else None
+    if pool is None:
+        print("[importance] WARNING: zero baseline = empty jet for the PFN; "
+              "completeness will not converge. Use ig_baselines > 0.")
+    alphas = (np.arange(cfg.ig_steps) + 0.5) / cfg.ig_steps
+    a_phi, a_glob = np.zeros((n, c, p)), np.zeros((n, g))
+    f_x, f_b = np.zeros(n), np.zeros(n)
+    fwd = lambda xp, xg, m: np.asarray(reg.forward(xp, xg if g else None, m)[:, 0],
+                                       np.float64)
+
+    for start in range(0, n, cfg.ig_batch):
+        sl = slice(start, min(start + cfg.ig_batch, n))
+        x_phi = tf.constant(d["x_phi"][sl], tf.float32)
+        x_glob = tf.constant(d["x_glob"][sl], tf.float32)
+        mask = tf.constant(d["mask"][sl], tf.float32)
+        acc_phi, acc_glob, fb = 0.0, 0.0, 0.0
+        for a in alphas:
+            b_phi, b_glob = (tf.constant(v) for v in _baseline(d, sl, pool, rng))
+            with tf.GradientTape() as tape:
+                z_phi = b_phi + a * (x_phi - b_phi)
+                z_glob = b_glob + a * (x_glob - b_glob)
+                tape.watch([z_phi, z_glob])
+                out = tf.reduce_sum(reg.forward(z_phi, z_glob if g else None, mask)[:, 0])
+            gr_phi, gr_glob = tape.gradient(out, [z_phi, z_glob])
+            if gr_phi is None:
+                raise RuntimeError("no gradient reached x_phi; forward() is broken")
+            acc_phi = acc_phi + (x_phi - b_phi).numpy() * gr_phi.numpy()
+            if g and gr_glob is not None:
+                acc_glob = acc_glob + (x_glob - b_glob).numpy() * gr_glob.numpy()
+            fb = fb + fwd(b_phi, b_glob, mask) / len(alphas)
+        a_phi[sl] = acc_phi / len(alphas) * scale * d["mask"][sl][..., None]
+        a_glob[sl] = np.asarray(acc_glob) / len(alphas) * scale
+        f_x[sl], f_b[sl] = fwd(x_phi, x_glob, mask) * scale, fb * scale
+
+    # completeness: sum of attributions must equal f(x) - f(baseline)
+    total, gap = a_phi.sum((1, 2)) + a_glob.sum(1), f_x - f_b
+    k = min(cfg.ig_check_jets, n)
+    per_jet = np.abs(total[:k] - gap[:k]) / np.maximum(np.abs(gap[:k]), 1e-6)
+    dataset = float(abs(np.mean(total - gap)) / max(np.mean(np.abs(gap)), 1e-12))
+    if verbose:
+        print(f"[importance] completeness: per-jet median {np.median(per_jet):.2e}, "
+              f"dataset {dataset:.2e}")
+        if dataset > 0.02:
+            print("[importance] WARNING: completeness above 2%; raise ig_steps")
+    return {"phi": a_phi, "glob": a_glob, "f_x": f_x, "f_base": f_b,
+            "completeness": per_jet, "completeness_dataset": dataset}
+
+
+def summarize_attributions(attr: Mapping[str, np.ndarray], d: dict,
+                           cfg: ImportanceConfig, pt_bins: np.ndarray) -> Dict[str, dict]:
+    """Mean |attribution| per feature (abs taken AFTER the set sum), with
+    bootstrap error and per-reco-pT-bin values."""
+    rng = np.random.default_rng(cfg.seed + 1)
+    per_jet = np.concatenate([attr["phi"].sum(1), attr["glob"]], axis=1)
+    b = np.clip(np.digitize(d["pt_reco"], pt_bins) - 1, 0, len(pt_bins) - 2)
+    out = {}
+    for j, name in enumerate(feature_names(d)):
+        a = np.abs(per_jet[:, j])
+        boot = [a[rng.integers(0, len(a), len(a))].mean() for _ in range(cfg.n_bootstrap)]
+        out[name] = {"mean_abs": float(a.mean()), "mean_abs_err": float(np.std(boot, ddof=1)),
+                     "mean_signed": float(per_jet[:, j].mean()),
+                     "per_pt": [float(a[b == i].mean()) if (b == i).any() else float("nan")
+                                for i in range(len(pt_bins) - 1)]}
+    return out
+
+
+# ------------------------------------------------------ perturbation probes
+
+def _perturb(d: dict, cols: Sequence[Tuple[str, int]], donor: Optional[np.ndarray]) -> dict:
+    """Copy of ``d`` with ``cols`` taken from ``donor`` jets (or zeroed = mean).
+
+    Constituent columns move as whole jet blocks and only into slots where
+    donor and receiver are both real, so the mask is exactly preserved.
+    """
+    out = dict(d)
+    mask = np.asarray(d["mask"], bool)
+    both = mask & mask[donor] if donor is not None else mask
+    for level, j in cols:
+        key = "x_phi" if level == "const" else "x_glob"
+        x = np.array(out[key], np.float32)
+        if level == "const":
+            src = d["x_phi"][donor][..., j] if donor is not None else 0.0
+            x[..., j] = np.where(both, src, x[..., j])
+            x *= mask[..., None]
+        else:
+            x[:, j] = d["x_glob"][donor][:, j] if donor is not None else 0.0
+        out[key] = x
+    return out
+
+
+def _donors(pt_reco: np.ndarray, strata: int, rng: np.random.Generator) -> np.ndarray:
+    """Permutation of jets, drawn within equal-population reco-pT strata."""
+    order = np.argsort(pt_reco, kind="stable") if strata > 1 else np.arange(len(pt_reco))
+    donor = np.empty(len(pt_reco), np.int64)
+    for block in np.array_split(order, strata):
+        donor[block] = rng.permutation(block)
+    return donor
+
+
+def perturbation_importance(reg: Any, d: dict, cfg: ImportanceConfig,
+                            groups: Mapping[str, List], pt_bins: np.ndarray,
+                            method: str = "pfi") -> Dict[str, dict]:
+    """FOM degradation when each entry of ``groups`` is permuted or occluded.
+
+    Returns:
+        ``{entry: {<fom>: {delta, err, nominal}, per_pt: [...]}}``.
+    """
+    rng = np.random.default_rng(cfg.seed + 2)
+    pt_true = np.asarray(d["pt_true"], np.float64)
+    pt_nom = calibrated_pt(reg, d)
+    b = np.clip(np.digitize(d["pt_reco"], pt_bins) - 1, 0, len(pt_bins) - 2)
+    repeats = cfg.pfi_repeats if method == "pfi" else 1
+    out = {}
+    for name, cols in groups.items():
+        pt_var = [calibrated_pt(reg, _perturb(
+            d, cols, _donors(d["pt_reco"], cfg.pfi_strata, rng) if method == "pfi" else None))
+            for _ in range(repeats)]
+        rec: Dict[str, Any] = {}
+        for key in cfg.fom:
+            nom = _fom(pt_nom, pt_true, key)
+            rec[key] = {"delta": float(np.mean([_fom(p, pt_true, key) - nom for p in pt_var])),
+                        "err": _paired_bootstrap(pt_var, pt_nom, pt_true, key,
+                                                 cfg.n_bootstrap, rng),
+                        "nominal": float(nom)}
+        head = cfg.fom[0]
+        rec["per_pt"] = [float(np.mean([_fom(p[b == i], pt_true[b == i], head)
+                                        - _fom(pt_nom[b == i], pt_true[b == i], head)
+                                        for p in pt_var]))
+                         if (b == i).sum() >= 100 else float("nan")
+                         for i in range(len(pt_bins) - 1)]
+        out[name] = rec
+        print(f"[importance] {method:<9} {name:<28} d{head} = "
+              f"{rec[head]['delta']:+.5f} +- {rec[head]['err']:.5f}")
+    return out
+
+
+def invariance_null_test(reg: Any, d: dict, seed: int = 0) -> Dict[str, float]:
+    """Shuffle constituents within each jet; the PFN output must not change."""
+    rng = np.random.default_rng(seed)
+    mask = np.asarray(d["mask"], bool)
+    order = np.argsort(np.where(mask, rng.random(mask.shape), np.inf), axis=1)
+    d_shuf = dict(d, mask=np.take_along_axis(d["mask"], order, 1),
+                  x_phi=np.take_along_axis(d["x_phi"], order[..., None], 1))
+    rel = np.abs(calibrated_pt(reg, d_shuf) / calibrated_pt(reg, d) - 1.0)
+    return {"max_abs_rel_dev": float(rel.max()), "median_abs_rel_dev": float(np.median(rel))}
+
+
+def build_groups(d: dict, cfg: ImportanceConfig) -> Tuple[Dict[str, List], Dict[str, List]]:
+    """Single features and redundancy groups as ``{name: [(level, column)]}``.
+
+    Permuting one member of a correlated pair builds impossible jets, biasing
+    its delta either way; permuting the pair together stays on the data
+    manifold. Where single and group disagree, quote the group.
+    """
+    n_phi = len(d["phi_lbls"])
+    index = {name: (_level(name), i if i < n_phi else i - n_phi)
+             for i, name in enumerate(feature_names(d))}
+    singles = {name: [col] for name, col in index.items()}
+    groups = {}
+    for name, members in (cfg.groups or {}).items():
+        unknown = [m for m in members if m not in index]
+        if unknown:
+            raise KeyError(f"group {name!r}: unknown features {unknown}; "
+                           f"available {sorted(index)}")
+        groups[name] = [index[m] for m in members]
+    if cfg.auto_group > 0 and len(index) > 2:
+        # one scalar per feature per jet: mask-weighted set mean for constituents
+        n_c = np.maximum(d["mask"].sum(1, keepdims=True), 1)
+        summary = np.concatenate([(d["x_phi"] * d["mask"][..., None]).sum(1) / n_c,
+                                  d["x_glob"]], axis=1)
+        rho = np.atleast_2d(np.nan_to_num(spearmanr(summary).statistic))
+        dist = np.clip(1.0 - np.abs(rho), 0.0, None)
+        np.fill_diagonal(dist, 0.0)
+        labels = fcluster(linkage(squareform(dist, checks=False), "average"),
+                          t=cfg.auto_group, criterion="distance")
+        keys = list(index)
+        for cl in np.unique(labels):
+            members = [keys[i] for i in np.where(labels == cl)[0]]
+            if len(members) > 1:
+                groups["auto[" + "+".join(m.split(":")[1] for m in members) + "]"] = \
+                    [index[m] for m in members]
+    return singles, groups
+
+
+# ------------------------------------------------------------- orchestration
+
+def run_importance(run_dir: Union[str, Path], dataset: dict, split: str = "test",
+                   cfg: Optional[ImportanceConfig] = None
+                   ) -> Tuple[dict, Dict[str, np.ndarray]]:
+    """Full no-retrain study of one run, as deployed (same inputs, same PTQ).
+
+    Returns:
+        ``(records, arrays)``: JSON-safe results and the per-jet arrays
+        behind the beeswarm figure.
+    """
+    from jetcal.data import subsample
+    from jetcal.evaluation import load_run_context
+    from jetcal.models import BinnedMedianCorrection, load_regressor
+    from jetcal.quantization import quantize_inputs
+
+    cfg, run_dir = cfg or ImportanceConfig(), Path(run_dir)
+    run_cfg, d = load_run_context(run_dir, dataset, split)
+    d = subsample(quantize_inputs(d, run_cfg.quant), cfg.max_jets, cfg.seed)
+    reg = load_regressor(run_dir)
+    pt_true, pt_reco = (np.asarray(d[k], np.float64) for k in ("pt_true", "pt_reco"))
+    print(f"[importance] '{run_dir.name}': {len(pt_true)} {split} jets, "
+          f"{len(d['phi_lbls'])} constituent + {len(d['glob_lbls'])} jet inputs, "
+          f"{run_cfg.quant.describe()}")
+    pt_base = pt_reco * np.exp(BinnedMedianCorrection.load(run_dir).predict(pt_reco))
+    pt_bins = equal_count_bins(pt_reco, cfg.n_pt_bins)
+    singles, groups = build_groups(d, cfg)
+
+    rec: Dict[str, Any] = {
+        "run": run_dir.name, "split": split, "n_jets": len(pt_true),
+        "unit": "fraction of calibrated pT", "config": dataclasses.asdict(cfg),
+        "features": feature_names(d), "pt_bins": pt_bins.tolist(),
+        "reference": {run_dir.name: figures_of_merit(calibrated_pt(reg, d), pt_true),
+                      "Binned median": figures_of_merit(pt_base, pt_true),
+                      "Uncalibrated": figures_of_merit(pt_reco, pt_true)},
+        "null_test": invariance_null_test(reg, d, cfg.seed)}
+    print(f"[importance] permutation-invariance null test: "
+          f"{rec['null_test']['median_abs_rel_dev']:.1e} (must be ~0)")
+    arrays: Dict[str, np.ndarray] = {}
+    if "ig" in cfg.methods:
+        attr = integrated_gradients(reg, d, cfg)
+        rec["ig"] = summarize_attributions(attr, d, cfg, pt_bins)
+        rec["ig_completeness"] = {"median": float(np.median(attr["completeness"])),
+                                  "dataset": attr["completeness_dataset"]}
+        sub = np.random.default_rng(cfg.seed + 4).choice(
+            len(pt_true), min(cfg.beeswarm_jets, len(pt_true)), replace=False)
+        n_c = np.maximum(d["mask"].sum(1, keepdims=True), 1)
+        arrays["attribution"] = np.concatenate([attr["phi"].sum(1), attr["glob"]], 1)[sub]
+        arrays["feature_value"] = np.concatenate(
+            [(d["x_phi"] * d["mask"][..., None]).sum(1) / n_c, d["x_glob"]], 1)[sub]
+    for method in ("pfi", "occlusion"):
+        if method in cfg.methods:
+            rec[method] = perturbation_importance(reg, d, cfg, singles, pt_bins, method)
+            if groups:
+                rec[f"{method}_groups"] = perturbation_importance(
+                    reg, d, cfg, groups, pt_bins, method)
+    return rec, arrays
+
+
+# ------------------------------------------------------------------ ablation
+
+def build_ablation_configs(run_dir: Union[str, Path], out_dir: Union[str, Path],
+                           drop: Optional[Sequence[str]] = None,
+                           seeds: Sequence[int] = (0, 1, 2)) -> List[Path]:
+    """Write leave-one-feature-out RunConfig JSONs (plus full-input replicas).
+
+    Names follow ``abl_<tag>_s<seed>``; train them with ``scripts/train.py``
+    and collect them with :func:`collect_ablation`.
+    """
+    from jetcal.config import RunConfig
+
+    cfg = RunConfig.load(Path(run_dir) / "config.json")
+    if cfg.features.phi is None or cfg.features.glob is None:
+        raise ValueError("the reference config must list phi and glob explicitly")
+    phi, glob = list(cfg.features.phi), list(cfg.features.glob)
+    available = [f"const:{l}" for l in phi] + [f"glob:{l}" for l in glob]
+    drop = list(drop) if drop else available
+    if set(drop) - set(available):
+        raise KeyError(f"cannot ablate {sorted(set(drop) - set(available))}")
+    written = []
+    for feature in [None, *drop]:
+        if feature == f"const:{phi[0]}" and len(phi) == 1:
+            continue  # the PFN needs at least one constituent feature
+        tag = "full" if feature is None else feature.replace(":", "_")
+        for seed in seeds:
+            var = RunConfig.from_dict(cfg.to_dict())
+            var.seed, var.name = int(seed), f"abl_{tag}_s{seed}"
+            var.features.phi = tuple(l for l in phi if feature != f"const:{l}")
+            var.features.glob = tuple(l for l in glob if feature != f"glob:{l}")
+            written.append(var.save(Path(out_dir) / f"{var.name}.json"))
+    print(f"[importance] {len(written)} ablation configs -> {out_dir}")
+    return written
+
+
+def collect_ablation(runs_root: Union[str, Path], dataset: dict, split: str = "test",
+                     fom: Sequence[str] = VALID_FOMS) -> Dict[str, Any]:
+    """Per-feature FOM change of the retrained ``abl_*`` runs vs ``abl_full_*``.
+
+    Errors combine the seed spread of the variant and of the reference.
+    """
+    from jetcal.evaluation import predict_run
+
+    by_tag: Dict[str, List[Dict[str, float]]] = {}
+    for run in sorted(Path(runs_root).glob("abl_*")):
+        if (run / "config.json").is_file():
+            preds, d = predict_run(run, dataset, split, label="model")
+            by_tag.setdefault(run.name[4:].rsplit("_s", 1)[0], []).append(
+                figures_of_merit(preds["model"], d["pt_true"]))
+    if "full" not in by_tag:
+        raise FileNotFoundError(f"no abl_full_* reference run under {runs_root}")
+    stat = lambda runs, k, f: float(f([m[k] for m in runs]))
+    ref = {k: stat(by_tag["full"], k, np.mean) for k in fom}
+    ref_err = {k: stat(by_tag["full"], k, np.std) for k in fom}
+    feats = {tag.replace("_", ":", 1): {
+        k: {"delta": stat(runs, k, np.mean) - ref[k],
+            "err": float(np.hypot(stat(runs, k, np.std), ref_err[k])),
+            "n_seeds": len(runs)} for k in fom}
+        for tag, runs in by_tag.items() if tag != "full"}
+    return {"reference": {"n_seeds": len(by_tag["full"]), **ref},
+            "reference_err": ref_err, "features": feats}
+
+
+# ------------------------------------------------------------------- figures
+
+def _ordered(rec: Mapping) -> List[str]:
+    """Features by decreasing mean |attribution| (or PFI delta)."""
+    if "ig" in rec:
+        return sorted(rec["features"], key=lambda n: -rec["ig"][n]["mean_abs"])
+    head = rec["config"]["fom"][0]
+    return sorted(rec["features"], key=lambda n: -rec["pfi"][n][head]["delta"])
+
+
+def _plain(ax: plt.Axes, which: str = "x") -> None:
+    import matplotlib.ticker as tk
+    getattr(ax, f"{which}axis").set_major_formatter(tk.FuncFormatter(lambda v, _: f"{v:g}"))
+
+
+def plot_importance_ranking(rec: Mapping, save_path=None) -> plt.Figure:
+    """Left: mean |attribution| [% of pT]. Right: FOM change when permuted
+    (bars) or held at the mean (markers). High left + low right = used but
+    redundant (prune candidate; confirm with the ablation)."""
+    names = _ordered(rec)[::-1]
+    head = rec["config"]["fom"][0]
+    y, colors = np.arange(len(names)), [_LEVEL_COLOR[_level(n)] for n in names]
+    n_panels = 1 + int("pfi" in rec or "occlusion" in rec)
+    fig, axes = plt.subplots(1, n_panels, sharey=True,
+                             figsize=(10.5 * n_panels, 2.6 + 0.52 * len(names)),
+                             gridspec_kw=dict(wspace=0.10))
+    axes = np.atleast_1d(axes)
+    if "ig" in rec:
+        axes[0].barh(y, [100 * rec["ig"][n]["mean_abs"] for n in names],
+                     xerr=[100 * rec["ig"][n]["mean_abs_err"] for n in names],
+                     color=colors, height=0.7)
+        axes[0].set_xlabel(r"$\langle|\mathrm{attribution}|\rangle$ [% of $p_\mathrm{T}$]")
+        _plain(axes[0])
+    axes[0].set_yticks(y)
+    axes[0].set_yticklabels(tex_labels(names), fontsize=FS_TICK)
+    axes[0].legend(handles=[plt.Rectangle((0, 0), 1, 1, color=c, label=l) for l, c in
+                            (("Constituent", _LEVEL_COLOR["const"]),
+                             ("Jet", _LEVEL_COLOR["glob"]))],
+                   fontsize=FS_LEGEND - 2, loc="lower right")
+    atlas_label(axes[0])
+    if n_panels > 1:
+        ax = axes[1]
+        if "pfi" in rec:
+            ax.barh(y, [rec["pfi"][n][head]["delta"] for n in names],
+                    xerr=[rec["pfi"][n][head]["err"] for n in names],
+                    color=colors, height=0.7, alpha=0.85, label="Permuted")
+        if "occlusion" in rec:
+            ax.plot([rec["occlusion"][n][head]["delta"] for n in names], y, "k^",
+                    ms=MS + 1, label="Held at training mean")
+        draw_ideal(ax, "v", 0.0)
+        nominal = (rec.get("pfi") or rec["occlusion"])[names[0]][head]["nominal"]
+        ax.set_xlabel(rf"$\Delta$ {head.replace('_', ' ')} (nominal {nominal:.4f})")
+        ax.legend(fontsize=FS_LEGEND - 2)
+        _plain(ax)
+    save(fig, save_path)
+    return fig
+
+
+def plot_attribution_beeswarm(rec: Mapping, arrays: Mapping[str, np.ndarray],
+                              n_features: int = 10, save_path=None) -> plt.Figure:
+    """Signed attribution per jet for the top features, coloured by the jet's
+    percentile in that feature (blue left / red right = "large values push
+    the calibrated pT up")."""
+    names = _ordered(rec)[:n_features][::-1]
+    col = {n: i for i, n in enumerate(rec["features"])}
+    rng = np.random.default_rng(0)
+    fig, ax = plt.subplots(figsize=(16.5, 2.6 + 0.62 * len(names)))
+    for row, name in enumerate(names):
+        a = 100 * np.asarray(arrays["attribution"])[:, col[name]]
+        v = np.asarray(arrays["feature_value"])[:, col[name]]
+        sc = ax.scatter(a, row + rng.uniform(-0.24, 0.24, len(a)),
+                        c=v.argsort().argsort() / max(len(v) - 1, 1), cmap="coolwarm",
+                        s=9, alpha=0.5, linewidths=0, vmin=0, vmax=1, rasterized=True)
+    draw_ideal(ax, "v", 0.0)
+    ax.set_yticks(np.arange(len(names)))
+    ax.set_yticklabels(tex_labels(names), fontsize=FS_TICK)
+    ax.set_xlabel(r"Signed attribution [% of $p_\mathrm{T}$]")
+    _plain(ax)
+    cb = fig.colorbar(sc, ax=ax, pad=0.01, ticks=[0, 0.5, 1])
+    cb.ax.set_yticklabels(["low", "median", "high"])
+    cb.set_label("Feature value (percentile)", fontsize=FS_ANNOT)
+    atlas_label(ax)
+    save(fig, save_path)
+    return fig
+
+
+def plot_importance_vs_pt(rec: Mapping, n_features: int = 6, save_path=None) -> plt.Figure:
+    """Mean |attribution| (top) and PFI degradation (bottom) per equal-population
+    reco-pT bin; solid = constituent, dashed = jet input."""
+    names = _ordered(rec)[:n_features]
+    edges = np.asarray(rec["pt_bins"])
+    centers = np.sqrt(edges[:-1] * edges[1:])
+    rows = [k for k in ("ig", "pfi") if k in rec]
+    fig, axes = plt.subplots(len(rows), 1, figsize=(17, 4.8 * len(rows)), sharex=True,
+                             gridspec_kw=dict(hspace=0.07))
+    axes = np.atleast_1d(axes)
+    for i, name in enumerate(names):
+        style = dict(color=_PALETTE[i % len(_PALETTE)], marker="o", ms=MS - 1, lw=LW,
+                     ls="-" if _level(name) == "const" else "--")
+        for ax, key in zip(axes, rows):
+            vals = rec[key][name]["per_pt"]
+            ax.plot(centers, 100 * np.asarray(vals) if key == "ig" else vals,
+                    label=tex_label(name) if ax is axes[0] else None, **style)
+    for ax, key in zip(axes, rows):
+        if key == "ig":
+            ax.set_ylabel(r"$\langle|\mathrm{attr}|\rangle$ [% of $p_\mathrm{T}$]")
+            ax.set_yscale("log")
+        else:
+            draw_ideal(ax, "h", 0.0)
+            ax.set_ylabel(rf"$\Delta$ {rec['config']['fom'][0].replace('_', ' ')}")
+            _plain(ax, "y")
+    axes[0].legend(fontsize=FS_LEGEND - 4, ncol=3)
+    annotate_bins(axes[0], bin_width_note(edges, "GeV", tex_label("pt_EM"))
+                  + " (equal population)", loc="upper right")
+    atlas_label(axes[0])
+    axes[-1].set_xscale("log")
+    axes[-1].set_xticks(centers, [f"{c:.0f}" for c in centers])
+    axes[-1].set_xticks([], minor=True)
+    axes[-1].set_xlabel(tex_label("pt_EM", "GeV") + " (bin centres)")
+    save(fig, save_path)
+    return fig
+
+
+def plot_ablation(abl: Mapping, fom: str = "resolution_iqr", save_path=None) -> plt.Figure:
+    """FOM change after removing each input and retraining; the grey band is
+    the reference seed spread (bars inside it are free to drop)."""
+    feats = abl["features"]
+    order = sorted(feats, key=lambda n: feats[n][fom]["delta"])
+    y, band = np.arange(len(order)), abl["reference_err"][fom]
+    fig, ax = plt.subplots(figsize=(16, 3.0 + 0.52 * len(order)))
+    ax.axvspan(-band, band, color="gray", alpha=0.2, label="Reference seed spread")
+    ax.barh(y, [feats[n][fom]["delta"] for n in order],
+            xerr=[feats[n][fom]["err"] for n in order], height=0.7,
+            color=[_LEVEL_COLOR[_level(n)] for n in order])
+    draw_ideal(ax, "v", 0.0)
+    ax.set_yticks(y)
+    ax.set_yticklabels(tex_labels(order), fontsize=FS_TICK)
+    ax.set_xlabel(rf"$\Delta$ {fom.replace('_', ' ')} after removal and retraining "
+                  f"(reference {abl['reference'][fom]:.4f}, "
+                  f"{abl['reference']['n_seeds']} seeds)")
+    _plain(ax)
+    ax.legend(fontsize=FS_LEGEND - 2, loc="lower right")
+    atlas_label(ax)
+    save(fig, save_path)
+    return fig
+
+
+def write_records(rec: dict, path: Union[str, Path]) -> None:
+    Path(path).write_text(json.dumps(rec, indent=2) + "\n")

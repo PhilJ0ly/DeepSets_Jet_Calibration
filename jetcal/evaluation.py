@@ -1,0 +1,80 @@
+# Philippe Joly, ATLAS Level-0 trigger ML
+"""Rebuild a run's predictions from its directory, and tabulate metrics.
+
+Every study (evaluation, PTQ scans, feature importance) starts here, so the
+evaluated columns, validation split and fixed-point settings provably match
+the ones the run was trained / deployed with.
+"""
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Dict, Mapping, Optional, Tuple, Union
+
+import numpy as np
+
+from jetcal.config import RunConfig
+from jetcal.data import (carve_validation, invert_target, select_features,
+                         unstandardize_targets)
+from jetcal.metrics import response_metrics
+
+
+def load_run_context(run_dir: Union[str, Path], dataset: dict,
+                     split: str = "test") -> Tuple[RunConfig, dict]:
+    """Run config plus the dataset restricted to the run's inputs.
+
+    ``split="val"`` re-carves the run's own validation jets from the
+    training file; any other value uses ``dataset`` as is.
+    """
+    cfg = RunConfig.load(Path(run_dir) / "config.json")
+    d = select_features(dataset, phi=cfg.features.phi, glob=cfg.features.glob,
+                        target=list(cfg.features.target), verbose=False)
+    if split == "val":
+        _, d = carve_validation(d, cfg.training.val_frac, cfg.seed)
+    return cfg, d
+
+
+def calibrated_pt(reg, d: dict) -> np.ndarray:
+    """Calibrated jet pT from a loaded regressor."""
+    y = unstandardize_targets(reg.predict(d), d["norm"]["y"])[:, 0]
+    return invert_target(y, d["pt_reco"])
+
+
+def predict_run(run_dir: Union[str, Path], dataset: dict, split: str = "test",
+                label: Optional[str] = None) -> Tuple[Dict[str, np.ndarray], dict]:
+    """Uncalibrated, binned-median and model pT for one run, as deployed.
+
+    Input quantization stored in the run is applied to the data; weight and
+    activation quantizers are rebuilt into the graph by ``load_regressor``.
+
+    Returns:
+        ``({"Uncalibrated", "Binned median", label: pT}, feature-selected dict)``.
+    """
+    from jetcal.models import BinnedMedianCorrection, load_regressor
+    from jetcal.quantization import quantize_inputs
+
+    run_dir = Path(run_dir)
+    cfg, d = load_run_context(run_dir, dataset, split)
+    d_in = quantize_inputs(d, cfg.quant)
+    pt_reco = np.asarray(d["pt_reco"], np.float64)
+    return {"Uncalibrated": pt_reco,
+            "Binned median": pt_reco * np.exp(
+                BinnedMedianCorrection.load(run_dir).predict(pt_reco)),
+            label or run_dir.name: calibrated_pt(load_regressor(run_dir), d_in)}, d
+
+
+def evaluate_predictions(predictions: Mapping[str, np.ndarray], pt_true: np.ndarray,
+                         out_dir: Union[str, Path], split: str = "test"
+                         ) -> Dict[str, Dict[str, float]]:
+    """Write ``<split>_metrics.json`` and print a comparison table."""
+    metrics = {lab: response_metrics(pt, pt_true) for lab, pt in predictions.items()}
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / f"{split}_metrics.json").write_text(json.dumps(metrics, indent=2) + "\n")
+    cols = ("median_response", "resolution_iqr", "log_response_mae")
+    w = max(len(k) for k in metrics)
+    print(f"\n[evaluate] {split}: {len(pt_true)} jets")
+    print(f"  {'series':<{w}}" + "".join(f"{c:>20}" for c in cols))
+    for lab, m in metrics.items():
+        print(f"  {lab:<{w}}" + "".join(f"{m[c]:>20.4f}" for c in cols))
+    return metrics

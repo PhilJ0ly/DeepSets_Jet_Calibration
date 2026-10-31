@@ -1,0 +1,12 @@
+{
+  "methods": ["ig", "pfi", "occlusion"],
+  "ig_steps": 32,
+  "ig_baselines": 64,
+  "pfi_repeats": 10,
+  "pfi_strata": 10,
+  "fom": ["resolution_iqr", "closure_abs", "log_response_rmse"],
+  "n_bootstrap": 200,
+  "n_pt_bins": 8,
+  "max_jets": 100000,
+  "seed": 0
+}

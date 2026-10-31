@@ -1,0 +1,449 @@
+# Philippe Joly, ATLAS Level-0 trigger ML
+"""Post-training fixed-point quantization: emulation, bit scans, figures.
+
+Firmware arithmetic is emulated on top of the float model. A value is a
+signed, saturating Q(bits, int_bits) word: 1 sign bit, ``int_bits`` integer
+bits, ``bits - 1 - int_bits`` fractional bits, round to nearest.
+
+    quantize_array / tf_fake_quant   the fixed-point projection
+    quantize_inputs                  standardized inputs -> fixed point
+    quantize_functional_model        PFN graph -> quantized Dense/Activation twins
+    run_quant_scans                  weight/act, input and per-feature bit scans
+    plot_quant_scan / plot_bit_allocation / plot_quant_fidelity   report figures
+
+Quantized layers keep the base-class names and variables, so one float
+checkpoint loads into the float graph and into any quantized graph.
+
+Note: the report quotes formats as (total, integer incl. sign); in code
+``Q(bits, int_bits)`` the sign bit is separate, so report (16, 3) = Q(16, 2).
+"""
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+
+import numpy as np
+import tensorflow as tf
+
+from jetcal.config import QuantConfig, check_bits
+from jetcal.data import subsample
+from jetcal.metrics import (MIN_PER_BIN, binned, equal_count_bins,
+                            response_metrics, turnon_summary)
+from jetcal.style import (C_BINNED_MEDIAN, C_UNCALIBRATED, FS_ANNOT, FS_LEGEND,
+                          IDEAL_STYLE, LW, MODEL_COLORS, MS, annotate_bins,
+                          atlas_label, bin_width_note, draw_ideal, plt, save,
+                          tex_label, tidy_log_axis)
+
+
+# --------------------------------------------------------- fixed-point math
+
+def quantize_array(x: np.ndarray, bits: int, int_bits: int) -> np.ndarray:
+    """Round ``x`` to Q(bits, int_bits), saturating at [-2^i, 2^i - LSB]."""
+    check_bits(bits, int_bits, "quantize_array")
+    lsb = 2.0 ** -(bits - 1 - int_bits)
+    q_max = 2.0 ** (bits - 1) - 1.0
+    return np.clip(np.round(np.asarray(x, np.float64) / lsb), -q_max - 1, q_max) * lsb
+
+
+def tf_fake_quant(x: tf.Tensor, bits: int, int_bits: int) -> tf.Tensor:
+    """TF twin of :func:`quantize_array` (identity gradient)."""
+    lsb = 2.0 ** -(bits - 1 - int_bits)
+    q_max = 2.0 ** (bits - 1) - 1.0
+    q = tf.clip_by_value(tf.round(x / lsb), -q_max - 1, q_max) * lsb
+    return x + tf.stop_gradient(q - x)
+
+
+# ------------------------------------------------------- input quantization
+
+def resolve_feature_bits(spec: Optional[Union[int, dict]],
+                         labels: Sequence[str]) -> Optional[List[Optional[int]]]:
+    """Bit width per label from an int or ``{label: bits, "default": bits}``."""
+    if spec is None:
+        return None
+    if not isinstance(spec, dict):
+        return [int(spec)] * len(labels)
+    unknown = set(spec) - set(labels) - {"default"}
+    if unknown:
+        raise KeyError(f"input bit spec names unknown features {sorted(unknown)}")
+    out = [spec.get(lbl, spec.get("default")) for lbl in labels]
+    return out if any(b is not None for b in out) else None
+
+
+def quantize_inputs(d: dict, qcfg: QuantConfig, verbose: bool = False) -> dict:
+    """Dataset copy with fixed-point standardized inputs (pads stay zero)."""
+    if not qcfg.input_quant:
+        return d
+    out = dict(d)
+    for key, spec, lbl_key in (("x_phi", qcfg.input_phi_bits, "phi_lbls"),
+                               ("x_glob", qcfg.input_glob_bits, "glob_lbls")):
+        bits = resolve_feature_bits(spec, d[lbl_key])
+        if bits is None:
+            continue
+        x = np.array(d[key], np.float64)
+        for j, b in enumerate(bits):
+            if b is not None:
+                x[..., j] = quantize_array(x[..., j], b, qcfg.input_int_bits)
+        if key == "x_phi":
+            x *= np.asarray(d["mask"], np.float64)[..., None]
+        out[key] = x.astype(np.float32)
+        if verbose:
+            print(f"[quant] {key}: " + ", ".join(
+                f"{l}={'f32' if b is None else f'Q({b},{qcfg.input_int_bits})'}"
+                for l, b in zip(d[lbl_key], bits)))
+    return out
+
+
+# ----------------------------------------------------- quantized Keras graph
+
+_LAYER_CACHE: Dict[Tuple[int, str], type] = {}
+
+
+def _quant_layers(km: Any) -> Tuple[type, type]:
+    """(QDense, QActivation) classes for Keras module ``km`` (cached)."""
+    if (id(km), "dense") in _LAYER_CACHE:
+        return _LAYER_CACHE[(id(km), "dense")], _LAYER_CACHE[(id(km), "act")]
+
+    class QDense(km.layers.Dense):
+        """Dense with quantized kernel (weight format) and bias (act int bits)."""
+
+        def __init__(self, units: int, q_bits: Optional[int] = None,
+                     q_int_bits: int = 1, q_bias_int_bits: int = 3, **kw: Any) -> None:
+            super().__init__(units, **kw)
+            self.q_bits, self.q_int_bits = q_bits, int(q_int_bits)
+            self.q_bias_int_bits = int(q_bias_int_bits)
+
+        def call(self, inputs: tf.Tensor) -> tf.Tensor:
+            k, b = self.kernel, self.bias if self.use_bias else None
+            if self.q_bits is not None:
+                k = tf_fake_quant(k, self.q_bits, self.q_int_bits)
+                if b is not None:  # biases live at the pre-activation scale
+                    b = tf_fake_quant(b, self.q_bits, self.q_bias_int_bits)
+            y = tf.einsum("...i,ij->...j", inputs, k)
+            y = y + b if b is not None else y
+            return self.activation(y) if self.activation is not None else y
+
+    class QActivation(km.layers.Activation):
+        """Activation followed by output quantization."""
+
+        def __init__(self, activation: Any, q_bits: int = 8, q_int_bits: int = 3,
+                     **kw: Any) -> None:
+            super().__init__(activation, **kw)
+            self.q_bits, self.q_int_bits = int(q_bits), int(q_int_bits)
+
+        def call(self, inputs: tf.Tensor) -> tf.Tensor:
+            return tf_fake_quant(super().call(inputs), self.q_bits, self.q_int_bits)
+
+    # keep the base-class names: checkpoint paths derive from them
+    QDense.__name__ = QDense.__qualname__ = "Dense"
+    QActivation.__name__ = QActivation.__qualname__ = "Activation"
+    _LAYER_CACHE[(id(km), "dense")], _LAYER_CACHE[(id(km), "act")] = QDense, QActivation
+    return QDense, QActivation
+
+
+def quantize_functional_model(model: Any, km: Any, q: QuantConfig) -> Any:
+    """Clone a built PFN with quantized Dense and nonlinear Activation layers.
+
+    Component of a layer: TimeDistributed or 3-D input -> ``phi``; last Dense
+    -> ``output`` (weights only, its linear activation stays float); other
+    2-D layers -> ``f``. Only ``q.components`` are touched.
+    """
+    QDense, QAct = _quant_layers(km)
+    Dense, TD, Act = km.layers.Dense, km.layers.TimeDistributed, km.layers.Activation
+    inner = lambda l: l.layer if isinstance(l, TD) and isinstance(l.layer, Dense) \
+        else (l if isinstance(l, Dense) else None)
+    dense = [l for l in model.layers if inner(l) is not None]
+    if not dense:
+        raise ValueError(f"model '{model.name}' has no Dense layers")
+
+    def component(layer: Any) -> str:
+        if layer is dense[-1]:
+            return "output"
+        if isinstance(layer, TD):
+            return "phi"
+        try:
+            return "phi" if len(layer.input.shape) == 3 else "f"
+        except (AttributeError, ValueError):  # multi-input layer
+            return "f"
+
+    def qdense(layer: Any) -> Any:
+        return QDense(q_bits=q.weight_bits, q_int_bits=q.weight_int_bits,
+                      q_bias_int_bits=q.act_int_bits, **layer.get_config())
+
+    def clone(layer: Any) -> Any:
+        comp = component(layer)
+        if comp not in q.components:
+            return layer
+        if inner(layer) is not None and q.weight_bits is not None:
+            return TD(qdense(layer.layer), name=layer.name) \
+                if isinstance(layer, TD) else qdense(layer)
+        if isinstance(layer, Act) and q.act_bits is not None and comp != "output" \
+                and km.activations.serialize(layer.activation) != "linear":
+            cfg = layer.get_config()
+            return QAct(cfg.pop("activation"), q_bits=q.act_bits,
+                        q_int_bits=q.act_int_bits, **cfg)
+        return layer
+
+    qmodel = km.models.clone_model(model, clone_function=clone)
+    qmodel.set_weights(model.get_weights())
+    return qmodel
+
+
+# --------------------------------------------------------------- PTQ scans
+
+def quant_point_metrics(pt_q: np.ndarray, pt_ref: np.ndarray, pt_true: np.ndarray,
+                        rate_fraction: float = 0.05) -> Dict[str, float]:
+    """Resolution, closure, equal-rate sharpness and fidelity to the float model.
+
+    ``migration_frac`` is the fraction of jets whose trigger decision differs
+    from the float model at the same accept fraction.
+    """
+    pt_q, pt_ref = np.asarray(pt_q, np.float64), np.asarray(pt_ref, np.float64)
+    m = response_metrics(pt_q, pt_true)
+    try:
+        sharp = turnon_summary({"q": pt_q}, pt_true,
+                               rate_fraction=rate_fraction)["q"]["sharpness"]
+    except ValueError:
+        sharp = float("nan")
+    rel = np.abs(pt_q / np.maximum(pt_ref, 1e-9) - 1.0)
+    thr_q, thr_r = (np.quantile(p, 1 - rate_fraction) for p in (pt_q, pt_ref))
+    return {"resolution_iqr": m["resolution_iqr"],
+            "median_response": m["median_response"],
+            "sharpness": float(sharp),
+            "rel_dev_q68": float(np.quantile(rel, 0.68)),
+            "rel_dev_q95": float(np.quantile(rel, 0.95)),
+            "migration_frac": float(np.mean((pt_q > thr_q) != (pt_ref > thr_r))),
+            "n_jets": int(pt_true.size)}
+
+
+def run_quant_scans(run_dir: Union[str, Path], dataset: dict, split: str = "test",
+                    weight_bits: Sequence[int] = (8, 10, 12, 14, 16),
+                    input_bits: Sequence[int] = (6, 8, 10, 12, 14, 16),
+                    act_bits: Optional[int] = None, weight_int_bits: int = 2,
+                    act_int_bits: int = 5, input_int_bits: int = 4,
+                    per_feature: bool = True, rate_fraction: float = 0.05,
+                    max_jets: Optional[int] = None, seed: int = 0) -> dict:
+    """PTQ scans of one trained float run (no retraining).
+
+    * weight scan  -- weights and activations at ``b`` bits (activations
+      pinned to ``act_bits`` if given), inputs float.
+    * input scan   -- every standardized input at ``b`` bits, model float.
+    * allocation   -- one input feature at ``b`` bits, everything else float.
+
+    Integer bits are held fixed (set them from ``scripts/dynamic_range.py``)
+    so only the fractional bits vary. Returns a JSON-safe record dict.
+    """
+    from jetcal.evaluation import calibrated_pt, load_run_context
+    from jetcal.models import BinnedMedianCorrection, load_regressor
+
+    run_dir = Path(run_dir)
+    cfg, d = load_run_context(run_dir, dataset, split)
+    d = subsample(d, max_jets, seed)
+    pt_true, pt_reco = (np.asarray(d[k], np.float64) for k in ("pt_true", "pt_reco"))
+    reg_float = load_regressor(run_dir, quant_override=QuantConfig())
+    pt_ref = calibrated_pt(reg_float, d)
+    pt_base = pt_reco * np.exp(BinnedMedianCorrection.load(run_dir).predict(pt_reco))
+    point = lambda pt: quant_point_metrics(pt, pt_ref, pt_true, rate_fraction)
+    rec: dict = {"reference": point(pt_ref), "baseline": point(pt_base),
+                 "uncalibrated": point(pt_reco),
+                 "meta": {"run": run_dir.name, "split": split, "n_jets": len(pt_true),
+                          "rate_fraction": rate_fraction, "act_bits": act_bits,
+                          "int_bits": {"weight": weight_int_bits, "act": act_int_bits,
+                                       "input": input_int_bits}}}
+    print(f"[quant] '{run_dir.name}' on {len(pt_true)} {split} jets; "
+          f"int bits W={weight_int_bits} A={act_int_bits} I={input_int_bits}")
+
+    def log(tag: str, r: dict) -> None:
+        print(f"  {tag:<16} IQR/2med={r['resolution_iqr']:.4f}  "
+              f"|med-1|={abs(r['median_response'] - 1):.4f}  "
+              f"dev95={r['rel_dev_q95']:.2e}  migr={r['migration_frac']:.4f}")
+
+    rec["weight_scan"] = []
+    for b in sorted(weight_bits):
+        ab = act_bits or b
+        q = QuantConfig(mode="ptq", weight_bits=b, act_bits=ab,
+                        weight_int_bits=min(weight_int_bits, b - 1),
+                        act_int_bits=min(act_int_bits, ab - 1))
+        r = {"bits": b, **point(calibrated_pt(load_regressor(run_dir, q), d))}
+        rec["weight_scan"].append(r)
+        log(f"W/A {b}b", r)
+    if rec["weight_scan"][-1]["rel_dev_q95"] > 0.01:
+        print("[quant] WARNING: the widest point still deviates from float; "
+              "the integer bits (range), not the width, are limiting")
+
+    def on_inputs(q: QuantConfig) -> Dict[str, float]:
+        return point(calibrated_pt(reg_float, quantize_inputs(d, q)))
+
+    rec["input_scan"] = []
+    for b in sorted(input_bits):
+        r = {"bits": b, **on_inputs(QuantConfig(
+            mode="ptq", input_phi_bits=b, input_glob_bits=b,
+            input_int_bits=min(input_int_bits, b - 1)))}
+        rec["input_scan"].append(r)
+        log(f"inputs {b}b", r)
+
+    rec["allocation"] = {}
+    if per_feature:
+        for block, labels in (("phi", d["phi_lbls"]), ("glob", d["glob_lbls"])):
+            for label in labels:
+                rec["allocation"][label] = [{"bits": b, **on_inputs(QuantConfig(
+                    mode="ptq", input_int_bits=min(input_int_bits, b - 1),
+                    **{f"input_{block}_bits": {label: b}}))}
+                    for b in sorted(input_bits)]
+                log(f"{label} {min(input_bits)}b", rec["allocation"][label][0])
+    return rec
+
+
+# ----------------------------------------------------------------- figures
+
+def _xy(points: Sequence[dict], key: str) -> Tuple[np.ndarray, np.ndarray]:
+    return (np.asarray([p["bits"] for p in points], float),
+            np.asarray([p[key] for p in points], float))
+
+
+def plot_quant_scan(rec: dict, scan: str = "weight_scan",
+                    save_path: Optional[Union[str, Path]] = None) -> plt.Figure:
+    """Four panels vs total bit width: resolution, |median - 1|, equal-rate
+    sharpness, and per-jet deviation / decision migration from the float model.
+
+    References: float model (dashed grey), binned median (orange),
+    uncalibrated (dashed black). Migrations of exactly zero are drawn open on
+    the one-jet floor ("below the sensitivity of this sample").
+    """
+    pts, ref, base, unc = rec[scan], rec["reference"], rec["baseline"], rec["uncalibrated"]
+    xlabel = ("Weight / activation bit width" if scan == "weight_scan"
+              else "Input bit width (all features)")
+    c = MODEL_COLORS[0]
+    fig, axes = plt.subplots(2, 2, figsize=(21, 10.5), sharex=True,
+                             gridspec_kw=dict(hspace=0.08, wspace=0.20))
+    (ax_res, ax_med), (ax_sh, ax_fid) = axes
+
+    bits, res = _xy(pts, "resolution_iqr")
+    ax_res.plot(bits, res, marker="o", ms=MS, color=c, label="Quantized model")
+    ax_res.axhline(ref["resolution_iqr"], label="Float model", **IDEAL_STYLE)
+    ax_res.axhline(base["resolution_iqr"], color=C_BINNED_MEDIAN, lw=LW,
+                   label="Binned median")
+    ax_res.axhline(unc["resolution_iqr"], color=C_UNCALIBRATED, ls="--", lw=LW,
+                   label="Uncalibrated")
+    ax_res.set_ylabel(r"Response IQR / (2 $\times$ median)")
+    ax_res.legend(fontsize=FS_LEGEND - 3, loc="best", ncol=2)
+    atlas_label(ax_res)
+
+    _, med = _xy(pts, "median_response")
+    ax_med.plot(bits, np.abs(med - 1), marker="o", ms=MS, color=c)
+    ax_med.axhline(abs(ref["median_response"] - 1), **IDEAL_STYLE)
+    ax_med.axhline(abs(base["median_response"] - 1), color=C_BINNED_MEDIAN, lw=LW)
+    ax_med.set_yscale("log")
+    ax_med.set_ylabel(r"$|$median response $- 1|$")
+
+    _, sh = _xy(pts, "sharpness")
+    ax_sh.plot(bits, sh, marker="o", ms=MS, color=c)
+    ax_sh.axhline(ref["sharpness"], **IDEAL_STYLE)
+    ax_sh.axhline(base["sharpness"], color=C_BINNED_MEDIAN, lw=LW)
+    ax_sh.set_ylabel(r"$p_\mathrm{T}^{99} - p_\mathrm{T}^{50}$ [GeV]")
+    ax_sh.set_xlabel(xlabel)
+    annotate_bins(ax_sh, f"equal rate: {rec['meta']['rate_fraction']:.1%} accepted",
+                  loc="upper right")
+
+    floor = 1.0 / max(ref["n_jets"], 1)
+    for key, ls, q in (("rel_dev_q68", "-", "68"), ("rel_dev_q95", "--", "95")):
+        _, v = _xy(pts, key)
+        ax_fid.plot(bits, np.where(v > 0, v, np.nan), marker="o", ms=MS, ls=ls,
+                    color=c, label=rf"$|\Delta p_\mathrm{{T}}| / p_\mathrm{{T}}$, {q}%")
+    _, mig = _xy(pts, "migration_frac")
+    ax_fid.plot(bits, np.where(mig > 0, mig, np.nan), marker="s", ms=MS,
+                color="#009e73", label="Trigger-decision migration")
+    if (mig <= 0).any():
+        ax_fid.plot(bits[mig <= 0], np.full((mig <= 0).sum(), floor), "s", ms=MS,
+                    mfc="none", mew=2.0, color="#009e73")
+    ax_fid.axhline(floor, color="gray", ls=":", lw=1.6)
+    ax_fid.set_yscale("log")
+    ax_fid.set_ylabel("Deviation from float model")
+    ax_fid.set_xlabel(xlabel)
+    ax_fid.legend(fontsize=FS_LEGEND - 3)
+    for ax in axes.ravel():
+        ax.set_xticks(bits)
+    save(fig, save_path)
+    return fig
+
+
+def plot_bit_allocation(rec: dict, save_path: Optional[Union[str, Path]] = None
+                        ) -> plt.Figure:
+    """Per-feature input precision: only the named feature is quantized.
+
+    Left: resolution (all-float value dashed grey). Right: 95% quantile of the
+    per-jet deviation from the float prediction. Legend ordered by damage at
+    the smallest width.
+    """
+    alloc, ref = rec["allocation"], rec["reference"]
+    if not alloc:
+        raise ValueError("no allocation scan in the records")
+    order = sorted(alloc, key=lambda l: -alloc[l][0]["resolution_iqr"])
+    fig, (ax_res, ax_fid) = plt.subplots(1, 2, figsize=(21, 6.6),
+                                         gridspec_kw=dict(wspace=0.20))
+    for i, label in enumerate(order):
+        style = dict(color=MODEL_COLORS[i % len(MODEL_COLORS)], marker="o", ms=MS - 1,
+                     ls=["-", "--", "-.", ":"][(i // len(MODEL_COLORS)) % 4])
+        bits, res = _xy(alloc[label], "resolution_iqr")
+        ax_res.plot(bits, res, label=tex_label(label), **style)
+        _, dev = _xy(alloc[label], "rel_dev_q95")
+        ax_fid.plot(bits, np.where(dev > 0, dev, np.nan), **style)
+    ax_res.axhline(ref["resolution_iqr"], label="All inputs float", **IDEAL_STYLE)
+    ax_res.set_ylabel(r"Response IQR / (2 $\times$ median)")
+    ax_res.legend(fontsize=FS_LEGEND - 5, ncol=3, title="only this feature quantized",
+                  title_fontsize=FS_LEGEND - 5)
+    atlas_label(ax_res)
+    ax_fid.set_yscale("log")
+    ax_fid.set_ylabel(r"$|\Delta p_\mathrm{T}| / p_\mathrm{T}$ vs float, 95%")
+    for ax in (ax_res, ax_fid):
+        ax.set_xlabel("Bit width of the quantized feature")
+        ax.set_xticks(bits)
+    save(fig, save_path)
+    return fig
+
+
+def plot_quant_fidelity(pt_q: np.ndarray, pt_ref: np.ndarray, pt_true: np.ndarray,
+                        rate_fraction: float = 0.05, label: str = "Quantized",
+                        save_path: Optional[Union[str, Path]] = None) -> plt.Figure:
+    """Fixed vs float at one operating point.
+
+    Left: per-jet ``pT_quant/pT_float - 1`` with its 68/95% quantiles and the
+    decision migration at ``rate_fraction``. Right: median and 95% quantile of
+    the deviation in equal-population bins of the float calibrated pT.
+    """
+    pt_q, pt_ref = np.asarray(pt_q, np.float64), np.asarray(pt_ref, np.float64)
+    dev = pt_q / np.maximum(pt_ref, 1e-9) - 1.0
+    fom = quant_point_metrics(pt_q, pt_ref, pt_true, rate_fraction)
+    fig, (ax_h, ax_b) = plt.subplots(1, 2, figsize=(20, 6.4),
+                                     gridspec_kw=dict(wspace=0.32))
+    span = max(float(np.quantile(np.abs(dev), 0.999)), 1e-6)
+    edges = np.linspace(-span, span, 81)
+    ax_h.hist(np.clip(dev, -span, span), bins=edges, histtype="step",
+              color=MODEL_COLORS[0], lw=LW)
+    draw_ideal(ax_h, "v", 0.0)
+    ax_h.set_yscale("log")
+    ax_h.set_xlabel(r"$p_\mathrm{T}^\mathrm{quant} / p_\mathrm{T}^\mathrm{float} - 1$")
+    ax_h.set_ylabel("Jets / bin")
+    ax_h.text(0.03, 0.88, f"{label}\n"
+              rf"$|\Delta|_{{68\%}}$ = {fom['rel_dev_q68']:.2e}" "\n"
+              rf"$|\Delta|_{{95\%}}$ = {fom['rel_dev_q95']:.2e}" "\n"
+              f"migration ({rate_fraction:.0%} accepted) = {fom['migration_frac']:.2%}",
+              transform=ax_h.transAxes, va="top", fontsize=FS_ANNOT)
+    annotate_bins(ax_h, bin_width_note(edges, "", r"$\Delta$"), loc="upper right")
+    atlas_label(ax_h)
+
+    pt_edges = equal_count_bins(pt_ref, max(4, min(20, pt_ref.size // MIN_PER_BIN)))
+    centers = np.sqrt(pt_edges[:-1] * pt_edges[1:])
+    for stat, ls, lab in (("median", "-", "Median"),
+                          (lambda v: np.quantile(v, 0.95), "--", "95%")):
+        ax_b.plot(centers, binned(pt_ref, np.abs(dev), pt_edges, stat), marker="o",
+                  ms=MS, ls=ls, color=MODEL_COLORS[0], label=lab)
+    ax_b.set_xscale("log")
+    ax_b.set_yscale("log")
+    tidy_log_axis(ax_b)
+    ax_b.set_xlabel(r"Float calibrated $p_\mathrm{T}$ [GeV]")
+    ax_b.set_ylabel(r"$|p_\mathrm{T}^\mathrm{quant} / p_\mathrm{T}^\mathrm{float} - 1|$")
+    ax_b.legend(fontsize=FS_LEGEND - 2)
+    annotate_bins(ax_b, bin_width_note(pt_edges, "GeV") + " (equal population)",
+                  loc="lower left")
+    save(fig, save_path)
+    return fig

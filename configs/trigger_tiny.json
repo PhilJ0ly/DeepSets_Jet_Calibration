@@ -1,0 +1,23 @@
+{
+  "name": "trigger_tiny",
+  "seed": 0,
+  "model": {
+    "phi_sizes": [7, 7],
+    "f_sizes": [7, 7, 7],
+    "phi_act": "relu",
+    "f_act": "relu"
+  },
+  "training": {
+    "loss": "huber",
+    "optimizer": "adamw",
+    "learning_rate": 0.001,
+    "epochs": 300,
+    "batch_size": 1024,
+    "es_patience": 40
+  },
+  "features": {
+    "phi": ["log_pt_c", "eta_c"],
+    "glob": ["log_pt_reco", "abs_eta", "eta", "log_m_over_pt"],
+    "target": ["log_pt_over_reco"]
+  }
+}
