@@ -24,3 +24,4 @@ python tests/test_pipeline.py --keep out   # keep every output for inspection
 
 It prints one `PASS`/`FAIL` line per check, stops at the first failure, and
 ends with `ALL <n> CHECKS PASSED`.
+

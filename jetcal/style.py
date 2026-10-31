@@ -1,4 +1,5 @@
-# Philippe Joly, ATLAS Level-0 trigger ML
+# Philippe Joly
+# This file was generatedClaude OPUS 5.5
 """Figure conventions shared by every plotting module.
 
     * Ideal reference (R = 1, the diagonal, the float model) -> dashed grey.

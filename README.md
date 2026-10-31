@@ -1,7 +1,8 @@
 # DeepSets jet energy calibration for the ATLAS Level-0 trigger
 
-Code for the CERN summer-student report *ATLAS Level-0 Trigger Jet Energy
-Calibration with DeepSets* (P. Joly, 2026).
+Code for CERN summer-student report:
+
+Joly, P. J. R. (2026). ATLAS Level-0 Trigger Jet Energy Calibration with DeepSets. CERN. [https://doi.org/10.17181/7nja9-q3z86.](https://doi.org/10.17181/7nja9-q3z86)
 
 A permutation-invariant DeepSets network (the EnergyFlow Particle Flow
 Network, PFN) regresses the jet energy correction `log(pT_true / pT_EM)` from
@@ -209,14 +210,9 @@ Every figure is written as `.svg` and as a 400 dpi `.png`.
   more than 2σ_seed, the spread over training seeds. Train the same config
   with `--seed 0/1/2` to measure it.
 
-## Compatibility with earlier run directories
+## AI Disclaimer
 
-Configs and run directories written by earlier versions of this code (with
-`backend`, `pooling` or other native-DeepSets keys) still load; those keys
-are ignored. Two cases need a manual fix:
-- **QAT runs:** quantization-aware training is not part of this release.
-- **Old PTQ runs:** directories made by the old `make_ptq.py` lack
-  `baseline.json`. Copy it from the float run.
+The `README.md` files and comments were gernerated using [Claude Opus 5.5](https://claude.ai/). Claude was also used to generate the plotting functions, the testing suite, and the `BASH` scripts.
 
 ## Author
 
